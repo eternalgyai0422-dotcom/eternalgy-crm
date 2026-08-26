@@ -3,12 +3,12 @@ import { getAuth } from "firebase/auth";
 import { getFirestore, doc, getDoc, setDoc, deleteDoc, collection, getDocs } from "firebase/firestore";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyCMoTrIb4XPhghdhZmXQm_kxYKrwFANgLQ",
-  authDomain: "eternalgy-crm-488da.firebaseapp.com",
-  projectId: "eternalgy-crm-488da",
-  storageBucket: "eternalgy-crm-488da.firebasestorage.app",
-  messagingSenderId: "1038580995629",
-  appId: "1:1038580995629:web:6f403b5f1a69fd9acfcaa4",
+  apiKey: "AIzaSyBsQXONc99MGiTLTh-lzlfsUgm1nyimIes",
+authDomain: "eternalgy-crm.firebaseapp.com",
+projectId: "eternalgy-crm",
+storageBucket: "eternalgy-crm.firebasestorage.app",
+messagingSenderId: "275979462445",
+appId: "1:275979462445:web:71c70b7348f053246095a4",
 };
 
 const app = initializeApp(firebaseConfig);
