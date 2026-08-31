@@ -22,7 +22,7 @@ const PROPERTY_TYPES = [
  { v: "Factory", en: "Factory", icon: Factory },
  { v: "Shop", en: "Shop", icon: Store },
 ];
-const SYSTEM_TYPES = ["NEM", "ATAP", "SELCO"];
+const SYSTEM_TYPES = ["NEM", "ATAP", "SELCO", "OFF GRID"];
 const BANK_OPTIONS = ["MBB", "PBB", "HLB", "AMBANK", "CIMB", "UOB", "OCBC", "OTHER"];
 const PAYMENT_MODE_OPTIONS = ["IBG", "CREDIT CARD", "EPP", "CASH DEPOSIT", "CHEQUE", "OTHER"];
 const ISSUE_TYPES = ["Roof Leak", "Power Trip", "Inverter Fault", "Panel Performance Drop", "Other"];
@@ -1304,6 +1304,190 @@ function buildPaymentThresholdReportDoc(thresholdPct, startDate, endDate, cases)
  return { title: `${label} ${startDate}~${endDate}`, html };
 }
 
+// across the top grouped by category, one customer per row, quantities in the cells, and a
+// column total at the bottom to order against. A component leaves the grid the moment its
+// install date is filled in, so what's left is exactly what still has to be bought.
+function buildMaterialRequirementReportDoc(cases) {
+ const live = cases.filter(c => !(c.cancellation && c.cancellation.isCancelled) && !installComplete(c));
+
+ // Pass 1 — work out which models are still outstanding, so the grid only carries live columns.
+ const rowsData = [];
+ const colMeta = {}; // model -> category
+ live.forEach(c => {
+ const need = {};
+ const want = (category, model, qty) => {
+ if (!model || !qty) return;
+ need[model] = (need[model] || 0) + qty;
+ if (!colMeta[model]) colMeta[model] = category;
+ };
+ if (!c.install.panel.date && c.pkg.panelModel) want("Panel", c.pkg.panelSizeW ? `${c.pkg.panelSizeW}W` : c.pkg.panelModel, Number(c.pkg.panelCount) || 0);
+ if (!c.install.inverter.date) {
+ if (c.pkg.inverterModel) want("Inverter", c.pkg.inverterModel, 1);
+ (c.pkg.inverterEntries || []).forEach(e => want("Inverter", e.model, Number(e.qty) || 1));
+ }
+ if (!c.install.battery.date) {
+ want("Battery", (c.pkg.battery && c.pkg.battery.model) || c.install.battery.model,
+ Number((c.pkg.battery && c.pkg.battery.qty) || c.install.battery.qty) || 1);
+ }
+ if (!c.install.ev.date && suppliesGoods(c)) {
+ want("EV Charger", (c.pkg.evCharger && c.pkg.evCharger.model) || c.install.ev.model,
+ Number((c.pkg.evCharger && c.pkg.evCharger.qty) || c.install.ev.qty) || 1);
+ }
+ if (!c.install.capBank.date) want("Cap Bank", c.install.capBank.model, Number(c.install.capBank.qty) || 1);
+ // FOC lines are giveaways rather than something to purchase, so they stay off this report.
+ (c.pkg.otherEntries || []).forEach(e => {
+ if (/\bFOC\b/i.test(e.name || "")) return;
+ want("Other", e.name, Number(e.qty) || 1);
+ });
+
+ if (Object.keys(need).length) rowsData.push({ c, need });
+ });
+
+ // Columns grouped by category, matching how stock is organised in the Item Directory.
+ const catOrder = ["Panel", "Inverter", "Battery", "EV Charger", "Cap Bank", "Other"];
+ const columns = Object.keys(colMeta).sort((a, b) => {
+ const ca = catOrder.indexOf(colMeta[a]), cb = catOrder.indexOf(colMeta[b]);
+ if (ca !== cb) return ca - cb;
+ return a.localeCompare(b);
+ });
+
+ const catColor = { Panel: "#0B2A4A", Inverter: "#2E7D6B", Battery: "#6B4E9E", "EV Charger": "#C2410C", "Cap Bank": "#C89B3C", Other: "#8B3A3A" };
+
+ // Two header rows: category bands on top, model names beneath.
+ const bands = [];
+ columns.forEach(m => {
+ const cat = colMeta[m];
+ const last = bands[bands.length - 1];
+ if (last && last.cat === cat) last.span++;
+ else bands.push({ cat, span: 1 });
+ });
+ const bandRow = `<tr><th style="border:1px solid #ccc;background:#fff;"></th><th style="border:1px solid #ccc;background:#fff;"></th>` +
+ bands.map(b => `<th colspan="${b.span}" style="border:1px solid #ccc;padding:5px;font-size:11px;color:#fff;background:${catColor[b.cat] || "#6B7686"};">${b.cat}</th>`).join("") +
+ `</tr>`;
+ const modelRow = `<tr style="background:#F5F3ED;">` +
+ `<th style="border:1px solid #ccc;padding:6px 8px;font-size:11.5px;text-align:left;">Customer</th>` +
+ `<th style="border:1px solid #ccc;padding:6px 8px;font-size:11.5px;text-align:left;">Agent</th>` +
+ columns.map(m => `<th style="border:1px solid #ccc;padding:6px 4px;font-size:10.5px;">${m}</th>`).join("") +
+ `</tr>`;
+
+ const body = rowsData.map(({ c, need }) =>
+ `<tr>` +
+ `<td style="border:1px solid #ccc;padding:5px 8px;font-size:11.5px;font-weight:bold;">${c.customerName || "-"}</td>` +
+ `<td style="border:1px solid #ccc;padding:5px 8px;font-size:11px;color:#666;">${agentDisplay(c)}</td>` +
+ columns.map(m => `<td style="border:1px solid #ccc;padding:5px 4px;font-size:11.5px;text-align:center;${need[m] ? "font-weight:bold;" : "color:#ddd;"}">${need[m] || "-"}</td>`).join("") +
+ `</tr>`
+ ).join("");
+
+ const totals = columns.map(m => rowsData.reduce((s, r) => s + (r.need[m] || 0), 0));
+ const totalRow = `<tr style="background:#FFF6DA;">` +
+ `<td colspan="2" style="border:1px solid #ccc;padding:6px 8px;font-size:12px;font-weight:bold;">TOTAL TO ORDER</td>` +
+ totals.map(t => `<td style="border:1px solid #ccc;padding:6px 4px;font-size:12.5px;text-align:center;font-weight:bold;color:#8A6414;">${t}</td>`).join("") +
+ `</tr>`;
+
+ const today = fmtDate(todayISO());
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Material Requirement (Purchasing) &nbsp;—&nbsp; ${today}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">*Outstanding goods for every case not yet installed. A quantity disappears from the grid once that component's install date is filled in.</div>
+ ${columns.length === 0
+ ? `<div style="padding:14px 0;color:#999;">Nothing outstanding.</div>`
+ : `<table style="width:100%;border-collapse:collapse;margin-top:10px;"><thead>${bandRow}${modelRow}</thead><tbody>${body}${totalRow}</tbody></table>`}
+ <div style="margin-top:12px;font-size:13px;">Pending cases: ${rowsData.length}</div>`;
+ return { title: `Material Requirement ${today}`, html };
+}
+
+// The completed counterpart to the purchasing matrix: same grid, but showing goods that have
+// already gone out (install date filled in) rather than what still needs buying. Selling price
+// is included here because these are finished jobs worth reconciling against revenue.
+function buildInstalledMaterialReportDoc(startDate, endDate, cases) {
+ const live = cases.filter(c =>
+ !(c.cancellation && c.cancellation.isCancelled) &&
+ installApplicableItems(c).some(k => c.install[k].date) &&
+ inRange(lastInstallDate(c), startDate, endDate)
+ );
+ live.sort((a, b) => (lastInstallDate(a) || "").localeCompare(lastInstallDate(b) || ""));
+
+ const rowsData = [];
+ const colMeta = {};
+ live.forEach(c => {
+ const done = {};
+ const had = (category, model, qty) => {
+ if (!model || !qty) return;
+ done[model] = (done[model] || 0) + qty;
+ if (!colMeta[model]) colMeta[model] = category;
+ };
+ // Mirror of the purchasing report — here we count components that DO have an install date.
+ if (c.install.panel.date && c.pkg.panelModel) had("Panel", c.pkg.panelSizeW ? `${c.pkg.panelSizeW}W` : c.pkg.panelModel, Number(c.pkg.panelCount) || 0);
+ if (c.install.inverter.date) {
+ if (c.pkg.inverterModel) had("Inverter", c.pkg.inverterModel, 1);
+ (c.pkg.inverterEntries || []).forEach(e => had("Inverter", e.model, Number(e.qty) || 1));
+ }
+ if (c.install.battery.date) {
+ had("Battery", (c.pkg.battery && c.pkg.battery.model) || c.install.battery.model,
+ Number((c.pkg.battery && c.pkg.battery.qty) || c.install.battery.qty) || 1);
+ }
+ if (c.install.ev.date && suppliesGoods(c)) {
+ had("EV Charger", (c.pkg.evCharger && c.pkg.evCharger.model) || c.install.ev.model,
+ Number((c.pkg.evCharger && c.pkg.evCharger.qty) || c.install.ev.qty) || 1);
+ }
+ if (c.install.capBank.date) had("Cap Bank", c.install.capBank.model, Number(c.install.capBank.qty) || 1);
+ (c.pkg.otherEntries || []).forEach(e => {
+ if (/\bFOC\b/i.test(e.name || "")) return;
+ had("Other", e.name, Number(e.qty) || 1);
+ });
+
+ if (Object.keys(done).length) rowsData.push({ c, done });
+ });
+
+ const catOrder = ["Panel", "Inverter", "Battery", "EV Charger", "Cap Bank", "Other"];
+ const columns = Object.keys(colMeta).sort((a, b) => {
+ const ca = catOrder.indexOf(colMeta[a]), cb = catOrder.indexOf(colMeta[b]);
+ if (ca !== cb) return ca - cb;
+ return a.localeCompare(b);
+ });
+ const catColor = { Panel: "#0B2A4A", Inverter: "#2E7D6B", Battery: "#6B4E9E", "EV Charger": "#C2410C", "Cap Bank": "#C89B3C", Other: "#8B3A3A" };
+
+ const bands = [];
+ columns.forEach(m => {
+ const cat = colMeta[m];
+ const last = bands[bands.length - 1];
+ if (last && last.cat === cat) last.span++;
+ else bands.push({ cat, span: 1 });
+ });
+ const bandRow = `<tr><th style="border:1px solid #ccc;background:#fff;"></th><th style="border:1px solid #ccc;background:#fff;"></th><th style="border:1px solid #ccc;background:#fff;"></th>` +
+ bands.map(b => `<th colspan="${b.span}" style="border:1px solid #ccc;padding:5px;font-size:11px;color:#fff;background:${catColor[b.cat] || "#6B7686"};">${b.cat}</th>`).join("") +
+ `<th style="border:1px solid #ccc;background:#fff;"></th></tr>`;
+ const modelRow = `<tr style="background:#F5F3ED;">` +
+ `<th style="border:1px solid #ccc;padding:6px 8px;font-size:11.5px;text-align:left;">Customer</th>` +
+ `<th style="border:1px solid #ccc;padding:6px 8px;font-size:11.5px;text-align:left;">Agent</th>` +
+ `<th style="border:1px solid #ccc;padding:6px 6px;font-size:11px;">Install Date</th>` +
+ columns.map(m => `<th style="border:1px solid #ccc;padding:6px 4px;font-size:10.5px;">${m}</th>`).join("") +
+ `<th style="border:1px solid #ccc;padding:6px 8px;font-size:11.5px;">Selling Price</th></tr>`;
+
+ const body = rowsData.map(({ c, done }) =>
+ `<tr>` +
+ `<td style="border:1px solid #ccc;padding:5px 8px;font-size:11.5px;font-weight:bold;">${c.customerName || "-"}</td>` +
+ `<td style="border:1px solid #ccc;padding:5px 8px;font-size:11px;color:#666;">${agentDisplay(c)}</td>` +
+ `<td style="border:1px solid #ccc;padding:5px 6px;font-size:11px;text-align:center;">${lastInstallDate(c) ? fmtDate(lastInstallDate(c)) : "-"}</td>` +
+ columns.map(m => `<td style="border:1px solid #ccc;padding:5px 4px;font-size:11.5px;text-align:center;${done[m] ? "font-weight:bold;" : "color:#ddd;"}">${done[m] || "-"}</td>`).join("") +
+ `<td style="border:1px solid #ccc;padding:5px 8px;font-size:11.5px;text-align:right;font-weight:bold;">${fmtMoney(c.pkg.sellingPrice)}</td>` +
+ `</tr>`
+ ).join("");
+
+ const totals = columns.map(m => rowsData.reduce((s, r) => s + (r.done[m] || 0), 0));
+ const grandTotal = rowsData.reduce((s, r) => s + (Number(r.c.pkg.sellingPrice) || 0), 0);
+ const totalRow = `<tr style="background:#FFF6DA;">` +
+ `<td colspan="3" style="border:1px solid #ccc;padding:6px 8px;font-size:12px;font-weight:bold;">TOTAL INSTALLED</td>` +
+ totals.map(t => `<td style="border:1px solid #ccc;padding:6px 4px;font-size:12.5px;text-align:center;font-weight:bold;color:#8A6414;">${t}</td>`).join("") +
+ `<td style="border:1px solid #ccc;padding:6px 8px;font-size:12.5px;text-align:right;font-weight:bold;color:#8A6414;">${fmtMoney(grandTotal)}</td></tr>`;
+
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Installed Material Report &nbsp;—&nbsp; ${dateRangeLabel(startDate, endDate)}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">*Goods already delivered and installed, by case. Grouped by the last install date in the range. FOC give-away items are excluded.</div>
+ ${columns.length === 0
+ ? `<div style="padding:14px 0;color:#999;">No installations in this range.</div>`
+ : `<table style="width:100%;border-collapse:collapse;margin-top:10px;"><thead>${bandRow}${modelRow}</thead><tbody>${body}${totalRow}</tbody></table>`}
+ <div style="margin-top:12px;font-size:13px;">Cases: ${rowsData.length} &nbsp;|&nbsp; Total value: ${fmtMoney(grandTotal)}</div>`;
+ return { title: `Installed Material ${startDate}~${endDate}`, html };
+}
+
 function buildInstallQueueReportDoc(cases) {
  // Solar work waits for 60% because SEDA/TNB approvals sit in between. EV Charger and Other
  // jobs have no approval stage, so a deposit is enough to schedule the crew.
@@ -2343,8 +2527,13 @@ function CaseForm({ initial, onSave, onCancel, onDelete, agentDirectory, itemDir
  <TextInput value={c.customerName} onChange={e => set("customerName", e.target.value)} placeholder="Customer name (SEDA applicant)"
  style={{ padding: "5px 7px", fontSize: 12, ...(!c.customerName ? { borderColor: "#C24141", background: "#FBEAEA" } : {}) }} />
  </Field>
- <Field label="TIN Number">
- <TextInput value={c.tin} onChange={e => set("tin", e.target.value)} placeholder="Customer TIN Number" style={{ padding: "5px 7px", fontSize: 12 }} />
+ {/* Mirrored from Package Details so the customer's property type is visible while keying in
+ their details, without having to switch tabs. Read-only here — edit it in Package Details. */}
+ <Field label="Property Type (from Package Details)">
+ <div style={{ padding: "5px 7px", fontSize: 12, border: "1px solid #F0ECE1", borderRadius: 8,
+ background: "#FBFAF6", color: "#6B7686" }}>
+ {c.pkg.propertyType || "-"}
+ </div>
  </Field>
  <Field label="IC / Passport No.">
  <TextInput value={c.ic} onChange={e => set("ic", e.target.value)} placeholder="IC No. or Passport No." style={{ padding: "5px 7px", fontSize: 12 }} />
@@ -2354,6 +2543,9 @@ function CaseForm({ initial, onSave, onCancel, onDelete, agentDirectory, itemDir
  </Field>
  <Field label="Contact">
  <TextInput value={c.customerPhone} onChange={e => set("customerPhone", e.target.value)} placeholder="012-3456789" style={{ padding: "5px 7px", fontSize: 12 }} />
+ </Field>
+ <Field label="TIN Number">
+ <TextInput value={c.tin} onChange={e => set("tin", e.target.value)} placeholder="Customer TIN Number" style={{ padding: "5px 7px", fontSize: 12 }} />
  </Field>
  </div>
  <Field label="Installation Address">
@@ -3332,10 +3524,11 @@ function CaseDetailReadOnly({ c, isAgentView, logDoc, actorName }) {
  <HeaderCard title="CUSTOMER PROFILE">
  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
  <Info label="Full Name" value={c.customerName || "-"} />
- <Info label="TIN Number" value={c.tin || "-"} />
+ <Info label="Property Type" value={c.pkg.propertyType || "-"} />
  <Info label="IC / Passport No." value={c.ic || "-"} />
  <Info label="Email" value={c.customerEmail || "-"} />
  <Info label="Contact" value={c.customerPhone || "-"} />
+ <Info label="TIN Number" value={c.tin || "-"} />
  </div>
  {c.billingName && c.billingName.trim() && c.billingName.trim() !== c.customerName.trim() && (
  <div style={{ marginBottom: 12 }}><Info label="Billing Name" value={c.billingName} /></div>
@@ -3841,13 +4034,19 @@ function Dashboard({ cases, itemDirectory, docLogs, agentDirectory }) {
  <ReportBtn onClick={() => printReport(buildPendingTnbApplicationReportDoc(reportCases))}>Pending TNB Application</ReportBtn>
  <ReportBtn onClick={() => printReport(buildPendingWelcomeLetterReportDoc(reportCases))}>Pending Welcome Letter</ReportBtn>
  </ReportGroup>
- <ReportGroup label="O&M / Install / O&M / Summary" color={DEPT.install.color}>
+ <ReportGroup label="Installation / O&M / Summary" color={DEPT.install.color}>
  <ReportBtn onClick={() => printReport(buildInstallReportDoc(rangeStart, rangeEnd, reportCases))}>Installation Report Install Report</ReportBtn>
  <ReportBtn onClick={() => printReport(buildOutstandingAfterInstallReportDoc(reportCases))}> Installed but Not Fully Paid</ReportBtn>
  <ReportBtn onClick={() => printReport(buildInstallQueueReportDoc(reportCases))}> Install Queue</ReportBtn>
- <ReportBtn onClick={() => printReport(buildShipmentReportDoc(rangeStart, rangeEnd, reportCases, itemDirectory))}>Shipment Report</ReportBtn>
  <ReportBtn onClick={() => printReport(buildOMReportDoc(reportCases))}>O&M Report</ReportBtn>
  <ReportBtn onClick={() => printReport(buildPropertyTypeSummaryDoc(rangeStart, rangeEnd, reportCases))}> Property Type Summary</ReportBtn>
+ </ReportGroup>
+ {/* Warehouse sits on its own — purchasing and goods movement are a different job from
+ tracking installation progress, and the two get read by different people. */}
+ <ReportGroup label="Warehouse / Purchasing" color="#7A5C2E">
+ <ReportBtn onClick={() => printReport(buildMaterialRequirementReportDoc(reportCases))}>Material Requirement (Purchasing)</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildInstalledMaterialReportDoc(rangeStart, rangeEnd, reportCases))}>Installed Material Report</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildShipmentReportDoc(rangeStart, rangeEnd, reportCases, itemDirectory))}>Shipment Report</ReportBtn>
  </ReportGroup>
  <ReportGroup label="Cancelled Packages" color={DEPT.cancellation.color}>
  <ReportBtn onClick={() => printReport(buildCancellationReportDoc(rangeStart, rangeEnd, reportCases))}> Cancellation Report</ReportBtn>
