@@ -10,6 +10,16 @@ export default function App() {
 
   useEffect(() => onAuthStateChanged(auth, setUser), []);
 
+  // The referral portal is meant to be opened by a customer/referrer who has no staff account —
+  // that's the whole point of the #ref= link. It must stay reachable even before Firebase has
+  // confirmed (or denied) a login, so it's checked first and bypasses the auth gate entirely.
+  // CRMApp itself already knows how to render just the referral form for this hash.
+  const hash = typeof window !== "undefined" ? window.location.hash : "";
+  const isReferralPortal = hash === "#referral" || /^#ref=/.test(hash);
+  if (isReferralPortal) {
+    return <CRMApp />;
+  }
+
   if (user === undefined) {
     return (
       <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
