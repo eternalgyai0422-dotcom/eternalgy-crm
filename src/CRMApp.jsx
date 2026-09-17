@@ -1,0 +1,6466 @@
+import React, { useState, useEffect, useMemo, useCallback, useContext, useRef } from "react";
+import { firebaseStorage } from "./firebase";
+
+// The CRM was written against a simple key/value store. Rather than rewrite every call site,
+// the same shape is backed by Firestore so data lives in the company's own database.
+const storage = firebaseStorage;
+
+import {
+ Sun, LayoutDashboard, FolderKanban, Plus, X, Search, ChevronDown, ChevronRight,
+ Wallet, FileCheck2, Truck, Zap, Wrench, ShieldCheck, PenLine, Link2, Users,
+ CheckCircle2, Circle, AlertTriangle, Home, Building2, Fuel, Factory, Store,
+ Trash2, Save, ArrowLeft, Filter, Printer, FileDown
+} from "lucide-react";
+
+/* ---------- constants ---------- */
+
+const PROPERTY_TYPES = [
+ { v: "Residential", en: "Residential", icon: Home },
+ { v: "Commercial", en: "Commercial", icon: Building2 },
+ { v: "Petrol Station", en: "Petrol Station", icon: Fuel },
+ { v: "Factory", en: "Factory", icon: Factory },
+ { v: "Shop", en: "Shop", icon: Store },
+];
+const SYSTEM_TYPES = ["NEM", "ATAP", "SELCO", "OFF GRID"];
+const BANK_OPTIONS = ["MBB", "PBB", "HLB", "AMBANK", "CIMB", "UOB", "OCBC", "OTHER"];
+const PAYMENT_MODE_OPTIONS = ["IBG", "CREDIT CARD", "EPP", "CASH DEPOSIT", "CHEQUE", "OTHER"];
+const ISSUE_TYPES = ["Roof Leak", "Power Trip", "Inverter Fault", "Panel Performance Drop", "Other"];
+const ISSUE_TYPE_EN = { "Roof Leak": "Roof Leak", "Power Trip": "Power Trip", "Inverter Fault": "Inverter Fault", "Panel Performance Drop": "Panel Performance Drop", "Other": "Other" };
+const ISSUE_TYPE_OPTIONS = ISSUE_TYPES.map(v => ({ value: v, label: `${v} ${ISSUE_TYPE_EN[v]}` }));
+const DEFAULT_DO_ITEMS = [
+ "Solar Panel", "Inverter", "Tile Hook", "Tile Hook (Landscape)",
+ "L-Bracket (Bolt & Nut)", "Klip-Lok", "L-Bracket (c/w screw)", "Standing Seam Base Grip",
+ "Hanger Bolt Kit", "Earthing clip", "MID Clamp", "End Clamp", "Bolt & Nut",
+ "Rail Splice", "Rail 3.6M", "Rail 2.4M", "Rail 1.2M",
+ "Breaker", "PV meter", "DB Box", "SPD", "Smart Meter", "Others",
+];
+
+const PHASE_TYPES = ["Single Phase", "Three Phase"];
+const PACKAGE_TYPES = ["Solar Package", "EV Charger Package", "Other Package"];
+// Solar jobs come in three flavours. Top Up adds panels/inverters to an existing system, so it
+// needs all the Solar hardware and the full DO checklist — but no SEDA/TNB, since the system is
+// already registered. Change SP replaces the service provider and does go through SEDA + TNB.
+const CASE_TYPES = ["New Installation", "Top Up", "Change SP"];
+// EV work splits three ways and each behaves differently downstream:
+// Combo Set = we supply the unit AND install it (goods + crew)
+// Wallbox Only = we sell the unit, customer arranges their own installer (goods, no crew)
+// Installation Only = customer already has the unit, we only wire it up (crew, no goods)
+const EV_JOB_TYPES = ["Combo Set", "Wallbox Only", "Installation Only"];
+const EV_JOB_COLORS = { "Combo Set": "#C2410C", "Wallbox Only": "#6B4E9E", "Installation Only": "#0E7C7B" };
+const isEV = (c) => c.pkg.packageType === "EV Charger Package";
+// Wallbox Only never gets scheduled — there's nothing for a crew to do.
+function needsInstallCrew(c) { return !(isEV(c) && c.pkg.evJobType === "Wallbox Only"); }
+// Installation Only uses the customer's own unit, so it must not draw down our stock.
+function suppliesGoods(c) { return !(isEV(c) && c.pkg.evJobType === "Installation Only"); }
+const CASE_TYPE_COLORS = { "New Installation": "#0B2A4A", "Top Up": "#0E7C7B", "Change SP": "#C2410C" };
+// Top Up skips the SEDA/TNB departments entirely — everything else stays.
+// SEDA/TNB only apply to grid-tied solar work. EV Charger and Other packages never touch them,
+// and a Top Up runs on a system that's already registered.
+function skipsSedaTnb(c) {
+ return c.pkg.packageType !== "Solar Package" || c.pkg.caseType === "Top Up";
+}
+const PACKAGE_TYPE_COLORS = {
+ "Solar Package": "#C89B3C",
+ "EV Charger Package": "#3C8C63",
+ "Other Package": "#6B4E9E",
+};
+const PACKAGE_TYPE_LABELS = {
+ "Solar Package": "☀️ SOLAR PACKAGE",
+ "EV Charger Package": "🔌 EV CHARGER PACKAGE",
+ "Other Package": "📦 OTHER PACKAGE",
+};
+const TNB_CUSTOMER_CARE_LINE = "1-300-88-5454";
+const EPP_BANKS = ["MBB", "PBB", "HLB", "CIMB", "AM Bank", "UOB", "OCBC"];
+const EPP_MONTHS = [6, 12, 18, 24, 36, 48, 60, 68];
+const EPP_RATE_TABLE = {
+ "MBB": { 6: 2.5, 12: 3.5, 24: 5.5, 36: 6.0, 48: 8.0, 60: 10.0 },
+ "PBB": { 6: 2.5, 12: 3.5, 18: 4.0, 24: 5.5, 36: 6.0, 48: 8.0, 60: 10.0 },
+ "HLB": { 12: 3.5, 24: 5.5, 36: 6.0, 48: 8.0, 60: 10.0 },
+ "CIMB": { 6: 2.5, 12: 3.5 },
+ "AM Bank": { 24: 7.0, 36: 9.0 },
+ "UOB": { 6: 2.5, 12: 3.5, 24: 5.5, 48: 8.5, 68: 11.5 },
+ "OCBC": { 6: 4.0, 12: 5.0, 18: 6.0, 24: 7.0, 36: 8.0, 48: 9.0 },
+};
+const REFUND_METHODS = ["Bank Transfer", "Cash", "Cheque", "Other"];
+const COLLECTED_METHODS = ["Credit Card", "IBG", "Cash", "Bank Transfer", "Other"];
+
+const DEPT = {
+ package: { label: "Package Details", cn: "Package Details", color: "#0B2A4A", icon: FileCheck2 },
+ payment: { label: "Payment Status", cn: "Payment Status", color: "#C89B3C", icon: Wallet },
+ seda: { label: "SEDA Status", cn: "SEDA", color: "#2E7D6B", icon: ShieldCheck },
+ install: { label: "Installation", cn: "Installation", color: "#2C5F8A", icon: Truck },
+ tnb: { label: "TNB", cn: "TNB", color: "#6B4E9E", icon: Zap },
+ om: { label: "O&M", cn: "O&M", color: "#C24141", icon: Wrench },
+ insurance:{ label: "Insurance", cn: "Insurance", color: "#3C8C63", icon: ShieldCheck },
+ referral: { label: "Referral", cn: "Referral", color: "#4A6FA5", icon: Link2 },
+ cancellation: { label: "Cancellation", cn: "Cancellation", color: "#8B3A3A", icon: AlertTriangle },
+};
+const DEPT_ORDER = ["package", "payment", "seda", "install", "tnb", "om", "insurance", "referral", "cancellation"];
+// Turns a camelCase field name like "panelCount" into "Panel Count" for a readable history line.
+function humanizeField(key) {
+ return key.replace(/([A-Z])/g, " $1").replace(/^./, s => s.toUpperCase()).trim();
+}
+const HISTORY_SKIP_FIELDS = new Set(["note", "note2", "editHistory"]);
+// Best-effort field-by-field diff between two department snapshots (e.g. prevCase.pkg vs
+// nextCase.pkg), producing readable "Field: old → new" lines. Arrays/sub-objects that changed
+// are named but not diffed line-by-line — going deeper than one level stops being worth reading
+// in a history log. Capped so one giant paste-in doesn't produce forty lines.
+function diffDeptFields(prevObj, nextObj) {
+ if (!prevObj || !nextObj) return [];
+ const lines = [];
+ const keys = new Set([...Object.keys(prevObj), ...Object.keys(nextObj)]);
+ keys.forEach(k => {
+ if (HISTORY_SKIP_FIELDS.has(k)) return;
+ const pv = prevObj[k];
+ const nv = nextObj[k];
+ if (JSON.stringify(pv) === JSON.stringify(nv)) return;
+ const label = humanizeField(k);
+ if (Array.isArray(pv) || Array.isArray(nv)) {
+ lines.push(`${label} updated`);
+ } else if (pv && typeof pv === "object" && nv && typeof nv === "object") {
+ diffDeptFields(pv, nv).forEach(sub => lines.push(`${label} — ${sub}`));
+ } else {
+ const pDisp = (pv === "" || pv === undefined || pv === null) ? "(empty)" : String(pv);
+ const nDisp = (nv === "" || nv === undefined || nv === null) ? "(empty)" : String(nv);
+ lines.push(`${label}: ${pDisp} → ${nDisp}`);
+ }
+ });
+ return lines.slice(0, 12);
+}
+// Compares the previous and next case snapshots. Returns which department tabs actually
+// changed, plus a readable detail line per department — one history entry per Save covers every
+// department touched in that single save, with everything that changed inside each one listed
+// together (e.g. "Panel Count: 15 → 20; Inverter Model: X → Y" under one Package Details entry).
+function changedDepartments(prevCase, nextCase) {
+ if (!prevCase) return { departments: [], details: {} };
+ const keyToDept = { pkg: "package", payment: "payment", seda: "seda", install: "install", tnb: "tnb", om: "om", insurance: "insurance", referral: "referral", cancellation: "cancellation" };
+ const departments = [];
+ const details = {};
+ Object.entries(keyToDept).forEach(([field, deptKey]) => {
+ if (JSON.stringify(prevCase[field]) !== JSON.stringify(nextCase[field])) {
+ departments.push(deptKey);
+ details[deptKey] = diffDeptFields(prevCase[field], nextCase[field]);
+ }
+ });
+ return { departments, details };
+}
+// Solar deals need the full government-process tabs (SEDA/TNB/Insurance). EV Charger and other
+// non-solar packages don't go through those, so keep their tab bar simple.
+function tabsForPackageType(packageType, caseType) {
+ if (packageType === "Solar Package") {
+ // Top Up works on an already-registered system, so SEDA/TNB don't apply.
+ if (caseType === "Top Up") return DEPT_ORDER.filter(d => d !== "seda" && d !== "tnb");
+ return DEPT_ORDER;
+ }
+ return ["package", "payment", "install", "om", "referral", "cancellation"];
+}
+const INSTALL_COMPONENTS = [["panel","Panel"],["inverter","Inverter"],["wiring","Wiring"],["battery","Battery"],["ev","EV Charger"],["capBank","Cap Bank"]];
+// EV Charger packages only install wiring, the charger itself, and the electric protection items —
+// no panels/inverter/battery/mounting structure involved.
+function installComponentsForPackageType(packageType) {
+ if (packageType === "EV Charger Package") return INSTALL_COMPONENTS.filter(([k]) => ["wiring", "ev"].includes(k));
+ return INSTALL_COMPONENTS;
+}
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const isoAddDays = (iso, days) => {
+ const d = new Date(iso + "T00:00:00");
+ d.setDate(d.getDate() + days);
+ return d.toISOString().slice(0, 10);
+};
+const isoAddYears = (iso, years) => {
+ const d = new Date(iso + "T00:00:00");
+ d.setFullYear(d.getFullYear() + years);
+ return d.toISOString().slice(0, 10);
+};
+const fmtMoney = (n) => "RM " + (Number(n) || 0).toLocaleString("en-MY", { minimumFractionDigits: 0 });
+const fmtNum = (n) => (Number(n) || 0).toLocaleString("en-MY", { minimumFractionDigits: 0 });
+const fmtMoney2 = (n) => "RM " + (Number(n) || 0).toLocaleString("en-MY", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const monthKey = (dateStr) => (dateStr ? dateStr.slice(0, 7) : null);
+// Reports/filters now use an arbitrary date range (from-to) instead of a single calendar month,
+// since management sometimes needs custom ranges like 01/01/2026 - 30/06/2026.
+const inRange = (dateStr, start, end) => !!dateStr && (!start || dateStr >= start) && (!end || dateStr <= end);
+const dateRangeLabel = (start, end) => `${start ? fmtDate(start) : "..."} - ${end ? fmtDate(end) : "..."}`;
+const MONTH_NAMES_EN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const monthLabel = (mk) => {
+ if (!mk) return "-";
+ const [y, m] = mk.split("-");
+ return `${MONTH_NAMES_EN[parseInt(m, 10) - 1]} ${y}`;
+};
+// Converts an internal ISO date string ("YYYY-MM-DD") to DD/MM/YYYY for display everywhere in
+// the UI and printed documents. Internal storage/sorting always stays ISO.
+const fmtDate = (iso) => {
+ if (!iso || iso.length < 10) return "-";
+ const [y, m, d] = iso.split("-");
+ return `${d}/${m}/${y}`;
+};
+const fmtDateFull = fmtDate; // kept as an alias so existing call sites don't need touching
+const DATE_MIN = "2024-01-01";
+
+function emptyCase() {
+ return {
+ id: uid(),
+ // Soft-delete marker. An empty string means the case is live; a timestamp means it was
+ // deleted and is sitting in the Recycle Bin (restorable within 100 days before it's purged
+ // for good). Kept as a plain field on the case itself rather than a separate storage
+ // collection, so nothing else about how cases are loaded/saved needs to change.
+ deletedAt: "",
+ caseNumber: "",
+ createdAt: "",
+ customerName: "",
+ billingName: "",
+ customerPhone: "",
+ customerEmail: "",
+ installAddress: "",
+ tin: "",
+ ic: "",
+ agentName: "",
+ agentCode: "",
+ pkg: {
+ packageType: "Solar Package",
+ caseType: "New Installation",
+ evJobType: "Combo Set",
+ propertyType: "Residential", systemType: "NEM", phaseType: "Single Phase", region: "", district: "",
+ panelCount: "", panelSizeW: "", panelModel: "", panelDescription: "",
+ inverterModel: "", inverterDescription: "",
+ // Extra inverter units beyond the first — a job occasionally needs 2-3, often different models.
+ inverterEntries: [],
+ battery: { model: "", price: "", qty: "", description: "" },
+ evCharger: { model: "", price: "", qty: "", description: "" },
+ atsEntries: [],
+ ballastEntries: [],
+ otherEntries: [],
+ // Charge-only lines (service fees, extra labour, etc.) — they add to the package price and
+ // print on the quotation, but never ship, so they're deliberately kept out of the DO.
+ serviceEntries: [],
+ basePrice: "",
+ discountEntries: [],
+ eppEntries: [],
+ sellingPrice: "", note: "",
+ },
+ payment: { records: [], note: "", isLoanCase: false, loReceivedDate: "", loanBank: "", loanApprovedAmount: "", loanRefNo: "",
+ // Management can green-light an install before the usual 60% is collected. It bypasses a
+ // payment control, so who approved it and why is recorded alongside the flag itself.
+ installOverride: false, overrideApprovedBy: "", overrideDate: "", overrideReason: "" },
+ // milestoneDate records when the post-installation milestone was updated with SEDA — the step
+ // that follows the physical install, tracked separately so it doesn't get forgotten.
+ seda: { submitDate: "", approvalDate: "", certificationNo: "", milestoneDate: "", eotDate: "", note: "" },
+ install: {
+ deliveryDate: "",
+ panel: { applicable: true, date: "", siteSupervisor: "", installer: "", wiringTeam: "" },
+ inverter: { applicable: true, date: "", siteSupervisor: "", installer: "", wiringTeam: "" },
+ wiring: { applicable: true, date: "", siteSupervisor: "", installer: "", wiringTeam: "" },
+ battery: { applicable: false, date: "", model: "", qty: 1, siteSupervisor: "", installer: "", wiringTeam: "" },
+ ev: { applicable: false, date: "", model: "", qty: 1, description: "", siteSupervisor: "", installer: "", wiringTeam: "" },
+ capBank: { applicable: false, date: "", model: "", qty: 1, siteSupervisor: "", installer: "", wiringTeam: "" },
+ mounting: { applicable: true, date: "", siteSupervisor: "", installer: "", wiringTeam: "" },
+ electrical: { applicable: true, date: "", siteSupervisor: "", installer: "", wiringTeam: "" },
+ otherItems: [],
+ note: "",
+ },
+ tnb: { applyDate: "", welcomeDate: "", tnbAccount: "", branch: "", note: "" },
+ om: { records: [], note: "" },
+ insurance: {
+ policyNo: "",
+ periods: [],
+ claimRecords: [],
+ note: "",
+ },
+ cancellation: {
+ isCancelled: false, cancelDate: "",
+ collectedAmount: "", collectedMethod: "",
+ refundAmount: "", refundReason: "", refundMethod: "",
+ companyRefundDate: "",
+ bankName: "", bankAccountNo: "", bankAccountHolder: "",
+ note: "",
+ },
+ referral: {
+ hasReferral: false,
+ name: "", ic: "", tin: "", email: "", date: "",
+ bankName: "", bankAccountNo: "", bankAccountHolder: "",
+ bankSubmittedAt: "",
+ // Referrers get a few attempts in case they mistype an account number. Only the latest
+ // submission is kept — earlier attempts are overwritten, so Admin never sees a wrong number
+ // sitting next to the right one and pays out to the wrong account.
+ submitCount: 0,
+ // Once Admin confirms the bank details are correct, locking the referral stops any further
+ // edits from the referral link — even if the link gets forwarded to someone else or the same
+ // referrer tries again. Only Admin can unlock it.
+ locked: false,
+ note: "",
+ },
+ delivery: {
+ pickupDateTime: "", deliveryDate: "", deliveryTimeStart: "", deliveryTimeEnd: "",
+ // Which half of the day this job runs — two crews go out daily, so the DO has to say which
+ // slot the customer should expect so they know when to be there to sign off, plus the exact
+ // arrival time when it's been pinned down.
+ installTimeSlot: "", installTime: "",
+ driverName: "", driverPhone: "", lorryNo: "",
+ materialPlanner: "", warehouseManager: "",
+ // Warehouse often preps ahead of the install, so these sign-off dates are entered by hand
+ // rather than defaulting to whenever the DO happens to be printed.
+ materialPlannerDate: "", warehouseManagerDate: "",
+ // Locked in the first time a DO is generated. Reprinting must never change the number, or
+ // two copies of the same delivery end up looking like two different documents.
+ doNumber: "",
+ remarks: "**Call before delivery.",
+ deliveryAddressSame: true, deliveryAddress: "",
+ items: DEFAULT_DO_ITEMS.map(name => ({ id: uid(), name, model: "", qty: "" })),
+ },
+ editHistory: [],
+ };
+}
+
+/* ---------- derived calculations ---------- */
+
+function paymentTotal(c) { return c.payment.records.reduce((s, r) => s + (Number(r.amount) || 0), 0); }
+function paymentPercent(c) {
+ const price = Number(c.pkg.sellingPrice) || 0;
+ if (!price) return 0;
+ return Math.min(100, Math.round((paymentTotal(c) / price) * 100));
+}
+function firstPaymentDate(c) {
+ const dates = c.payment.records.map(r => r.date).filter(Boolean).sort();
+ return dates[0] || null;
+}
+function lastPaymentDate(c) {
+ const dates = c.payment.records.map(r => r.date).filter(Boolean).sort();
+ return dates.length ? dates[dates.length - 1] : null;
+}
+function installApplicableItems(c) {
+ return INSTALL_COMPONENTS.map(([k]) => k).filter(k => c.install[k].applicable);
+}
+function installComplete(c) {
+ const items = installApplicableItems(c);
+ if (!items.length) return false;
+ // "Complete" for report purposes = at least one ticked component has an install date.
+ // Ticked (applicable) = this case needs this component installed.
+ // Dated = it's been installed. Un-dated = still pending.
+ // Reports show the pending items as a warning note rather than excluding the whole row.
+ return items.some(k => !!c.install[k].date);
+}
+// For Solar Package, returns components that are still pending (applicable but no date yet).
+// Used by the install report to add a "Still pending" note without excluding the row entirely.
+function installPendingItems(c) {
+ if (c.pkg.packageType !== "Solar Package") return [];
+ return INSTALL_COMPONENTS
+ .filter(([k, label]) => c.install[k].applicable && !c.install[k].date)
+ .map(([k, label]) => label);
+}
+function lastInstallDate(c) {
+ const items = installApplicableItems(c);
+ const dates = items.map(k => c.install[k].date).filter(Boolean).sort();
+ return dates[dates.length - 1] || null;
+}
+function completionScore(c) {
+ let score = 0;
+ score += paymentPercent(c) * 0.25;
+ score += (c.seda.submitDate ? 7 : 0) + (c.seda.approvalDate ? 8 : 0);
+ const items = installApplicableItems(c);
+ if (items.length) {
+ const done = items.filter(k => c.install[k].date).length;
+ score += (done / items.length) * 30;
+ }
+ score += (c.tnb.applyDate ? 10 : 0) + (c.tnb.welcomeDate ? 10 : 0);
+ score += c.insurance.periods.length > 0 ? 10 : 0;
+ return Math.round(score);
+}
+function stageOf(c) {
+ if (c.cancellation && c.cancellation.isCancelled)
+ return { label: "Cancelled", en: "Cancelled", color: "#8B3A3A" };
+ // Top Up has no SEDA/TNB leg, so install + full payment is the whole journey for it.
+ if (skipsSedaTnb(c) && installComplete(c) && paymentPercent(c) >= 100)
+ return { label: "Completed", en: "Completed", color: "#3C8C63" };
+ if (skipsSedaTnb(c) && installComplete(c))
+ return { label: "Balance", en: "Awaiting balance payment", color: "#2C5F8A" };
+ if (installComplete(c) && c.tnb.welcomeDate && paymentPercent(c) >= 100)
+ return { label: "Completed", en: "Completed", color: "#3C8C63" };
+ // After install, the case moves through TNB in stages — lumping them all under "Awaiting TNB"
+ // hides whether the application has actually been submitted yet.
+ if (installComplete(c)) {
+ if (c.tnb.welcomeDate) return { label: "Balance", en: "Awaiting balance payment", color: "#2C5F8A" };
+ if (c.tnb.applyDate) return { label: "TNB", en: "Awaiting Welcome Letter", color: "#2C5F8A" };
+ return { label: "TNB", en: "Awaiting TNB application", color: "#2C5F8A" };
+ }
+ if (c.install.deliveryDate || installApplicableItems(c).some(k => c.install[k].date))
+ return { label: "Installing", en: "Installing", color: "#C89B3C" };
+ // No SEDA/TNB leg on these, so once a deposit is in they're simply queued for the crew —
+ // saying "New case" would hide that they're already actionable.
+ if (skipsSedaTnb(c)) {
+ if (paymentTotal(c) > 0)
+ return { label: "New Case", en: "Awaiting install", color: "#C89B3C" };
+ return { label: "New Case", en: "Awaiting deposit", color: "#6B7686" };
+ }
+ // SEDA mirrors the TNB breakdown above — submitted and approved are different waits, and a
+ // case with nothing submitted yet is waiting on us, not on SEDA.
+ if (c.seda.approvalDate)
+ return { label: "SEDA", en: "Approved, awaiting install", color: "#2E7D6B" };
+ if (c.seda.submitDate)
+ return { label: "SEDA", en: "Awaiting SEDA approval", color: "#D98C3D" };
+ return { label: "New Case", en: "Pending SEDA application", color: "#6B7686" };
+}
+
+/* ---------- printable documents (reports / quotation / invoice) ---------- */
+/* These build {title, html} objects. Rendering + printing happens inline via
+ PrintOverlay + window.print(), NOT window.open(), because pop-ups are
+ frequently blocked inside the sandboxed artifact iframe. */
+
+const PrintContext = React.createContext(() => {});
+
+function seqFromId(id, mod) {
+ let h = 0;
+ for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) % 1000000;
+ return (h % mod) + 1;
+}
+
+const td = (v) => `<td style="border:1px solid #ccc;padding:7px 9px;font-size:12.5px;">${v}</td>`;
+const trHtml = (cells, rowStyle) => `<tr${rowStyle ? ` style="${rowStyle}"` : ""}>${cells.map(td).join("")}</tr>`;
+function styledTable(headers, bodyRowsHtml) {
+ const th = headers.map(h => `<th style="border:1px solid #ccc;padding:7px 9px;font-size:12.5px;text-align:left;background:#f4f1ea;">${h}</th>`).join("");
+ return `<table style="width:100%;border-collapse:collapse;margin-top:12px;"><thead><tr>${th}</tr></thead><tbody>${bodyRowsHtml}</tbody></table>`;
+}
+// Fallback for when window.print() is blocked (e.g. inside a sandboxed preview iframe that
+// doesn't allow modal dialogs) — saves the report as a standalone .html file the person can
+// open directly in a normal browser tab and print/save-as-PDF from there instead.
+function downloadReportHtml(doc) {
+ try {
+ const fullHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${doc.title}</title></head><body style="font-family:Arial,Helvetica,sans-serif;color:#1B2430;padding:24px;max-width:900px;margin:0 auto;">${doc.html}</body></html>`;
+ const blob = new Blob([fullHtml], { type: "text/html" });
+ const url = URL.createObjectURL(blob);
+ const a = document.createElement("a");
+ a.href = url;
+ a.download = `${doc.title.replace(/[^a-zA-Z0-9\u4e00-\u9fff]+/g, "_")}.html`;
+ document.body.appendChild(a);
+ a.click();
+ document.body.removeChild(a);
+ setTimeout(() => URL.revokeObjectURL(url), 1000);
+ } catch (e) { console.error(e); }
+}
+
+function buildLetterheadHtml() {
+ return `<div style="margin-bottom:14px;text-align:center;border-bottom:2px solid #0B2A4A;padding-bottom:10px;">
+ <h2 style="margin:0;font-size:19px;color:#0B2A4A;">Eternalgy Sdn. Bhd.</h2>
+ <p style="margin:2px 0;font-size:11px;color:#555;">202301029164 (1523087-A) &nbsp;|&nbsp; TIN No.: C5815978903</p>
+ <p style="margin:2px 0;font-size:11px;color:#555;">23-01, Jalan Mutiara Emas 10/19, Taman Mount Austin, 81100 Johor Bahru, Johor, Malaysia</p>
+ </div>`;
+}
+
+function packageBaseDescription(c) {
+ const type = c.pkg.packageType || "Solar Package";
+ const lines = [];
+
+ // Panel/Inverter lines only belong to Solar Package — even if panelModel/inverterModel data is
+ // still sitting on the case from before a package-type switch, don't let it leak into a non-solar bill.
+ if (type === "Solar Package") {
+ // Panel and Inverter each print as a two-line block: the spec line, then the Item Directory's
+ // professional description underneath — keeps the quotation readable instead of one long run-on.
+ if (c.pkg.panelCount || c.pkg.panelModel) {
+ const capacity = (((Number(c.pkg.panelCount) || 0) * (Number(c.pkg.panelSizeW) || 0)) / 1000).toFixed(2);
+ lines.push(`${c.pkg.panelCount || "-"}X ${c.pkg.panelModel || "-"} Solar Panel (${capacity}Kwp)`);
+ if (c.pkg.panelDescription) lines.push(c.pkg.panelDescription);
+ }
+ // Don't assume the inverter type (Hybrid/String/Micro/etc.) — that comes from whatever the
+ // Admin registered in the Item Directory's Description for this model.
+ if (c.pkg.inverterModel) {
+ lines.push(`1X ${c.pkg.inverterModel} Inverter (${c.pkg.phaseType || "-"})`);
+ if (c.pkg.inverterDescription) lines.push(c.pkg.inverterDescription);
+ }
+ (c.pkg.inverterEntries || []).forEach(e => {
+ if (!e.model) return;
+ lines.push(`${e.qty || 1}X ${e.model} Inverter (${c.pkg.phaseType || "-"})`);
+ if (e.description) lines.push(e.description);
+ });
+ lines.push(`1X SEDA ${c.pkg.systemType} Application`);
+ lines.push(`TNB Smart Meter Application`);
+ lines.push(`Solar System Architecture Design Electrical System Design`);
+ lines.push(`Roof and Site Surveying Roof Panel Installation`);
+ lines.push(`Electrical Works`);
+ lines.push(`SkyLift`);
+ lines.push(`Included: MIBET Mounting Structure, MasterTec DC Cable, MEGA AC Cable`);
+ // 3-Year MSIG coverage is a residential-only freebie — commercial/other property types don't get it.
+ if (c.pkg.propertyType === "Residential") lines.push(`3 Year MSIG All-Risk Solar System Coverage up to RM10,000 assured`);
+ }
+ // EV Charger / Other Package: no generic hardcoded wording — the professional description comes
+ // entirely from whatever Admin registered in the Item Directory for the selected item.
+ // Item Directory descriptions sometimes carry trailing newlines/whitespace from when they
+ // were pasted in, which show up as stray blank lines here — strip them so the block is tight.
+ return lines.map(l => String(l).trim()).filter(l => l !== "").join("\n");
+}
+
+// Reverse-calculates an EPP entry: given the TOTAL amount actually collected (which already has
+// bank interest baked in) plus the rate%, works out how much of it was principal vs interest.
+// total = principal * (1 + rate/100) => principal = total / (1 + rate/100)
+function computeEppEntry(totalAmount, ratePct) {
+ const total = Number(totalAmount) || 0;
+ const rate = Number(ratePct) || 0;
+ const principal = rate > 0 ? total / (1 + rate / 100) : total;
+ const principalRounded = Math.round(principal * 100) / 100;
+ // Interest is the remainder, so principal + interest always equals the total exactly (to the cent).
+ const interestRounded = Math.round((total - principalRounded) * 100) / 100;
+ return { principal: principalRounded, interest: interestRounded };
+}
+
+// Selling price is now fully derived: base package price + priced add-ons (Battery-or-EV-Charger/Other)
+// + all EPP interest entries added so far - all discount entries added so far. This is the single
+// source of truth used both to keep c.pkg.sellingPrice in sync live in the form, and to build the
+// printed billing breakdown.
+function computeSellingPrice(pkg) {
+ const type = pkg.packageType || "Solar Package";
+ // Base Package Price doesn't apply to EV Charger Package — its price comes entirely from the
+ // EV Charger item itself.
+ const base = type === "EV Charger Package" ? 0 : (Number(pkg.basePrice) || 0);
+ // Battery (Solar's optional add-on) and EV Charger (EV Charger Package's main item) are separate
+ // fields — they can never leak into each other just by switching package type.
+ const batteryAmt = (type === "Solar Package" && pkg.battery.model) ? (Number(pkg.battery.price) || 0) * (Number(pkg.battery.qty) || 1) : 0;
+ const evChargerAmt = (type === "EV Charger Package" && pkg.evCharger.model) ? (Number(pkg.evCharger.price) || 0) * (Number(pkg.evCharger.qty) || 1) : 0;
+ const otherAmt = (pkg.otherEntries || []).reduce((s, e) => s + (Number(e.price) || 0) * (Number(e.qty) || 1), 0);
+ const serviceAmt = (pkg.serviceEntries || []).reduce((s, e) => s + (Number(e.price) || 0) * (Number(e.qty) || 1), 0);
+ const eppTotal = (pkg.eppEntries || []).reduce((s, e) => s + (Number(e.interest) || 0), 0);
+ const discountTotal = (pkg.discountEntries || []).reduce((s, e) => s + (Number(e.amount) || 0), 0);
+ return base + batteryAmt + evChargerAmt + otherAmt + serviceAmt + eppTotal - discountTotal;
+}
+
+// Builds the full billing breakdown for printing: base package + priced add-ons (Battery/ATS entries/
+// Other) + each EPP interest entry + each Discount entry. Lines always sum exactly to
+// c.pkg.sellingPrice by construction.
+function buildBillingLines(c) {
+ const type = c.pkg.packageType || "Solar Package";
+ const addonRows = [];
+ if (type === "Solar Package" && c.pkg.battery.model) {
+ const q = Number(c.pkg.battery.qty) || 1;
+ const rate = Number(c.pkg.battery.price) || 0;
+ addonRows.push({ desc: c.pkg.battery.description ? `Battery: ${c.pkg.battery.model} - ${c.pkg.battery.description}` : `Battery: ${c.pkg.battery.model}`, qty: q, rate, amt: rate * q });
+ }
+ if (type === "EV Charger Package" && c.pkg.evCharger.model) {
+ const q = Number(c.pkg.evCharger.qty) || 1;
+ const rate = Number(c.pkg.evCharger.price) || 0;
+ addonRows.push({ desc: c.pkg.evCharger.description ? `EV Charger: ${c.pkg.evCharger.model} - ${c.pkg.evCharger.description}` : `EV Charger: ${c.pkg.evCharger.model}`, qty: q, rate, amt: rate * q });
+ }
+ (c.pkg.otherEntries || []).forEach(e => {
+ const q = Number(e.qty) || 1;
+ const rate = Number(e.price) || 0;
+ addonRows.push({ desc: `Other: ${e.name}`, qty: q, rate, amt: rate * q });
+ });
+ (c.pkg.serviceEntries || []).forEach(e => {
+ const q = Number(e.qty) || 1;
+ const rate = Number(e.price) || 0;
+ addonRows.push({ desc: e.name, qty: q, rate, amt: rate * q });
+ });
+
+ const baseAmount = type === "EV Charger Package" ? 0 : (Number(c.pkg.basePrice) || 0);
+ const baseDesc = packageBaseDescription(c);
+
+ const lines = [];
+ if (type !== "EV Charger Package" && (baseDesc.trim() || baseAmount !== 0)) {
+ lines.push({ desc: baseDesc || "Base Package", qty: 1, rate: baseAmount, amt: baseAmount, isBase: true });
+ }
+ addonRows.forEach(r => lines.push(r));
+ (c.pkg.eppEntries || []).forEach(e => {
+ lines.push({
+ desc: `EPP: RM${(Number(e.totalAmount) || 0).toFixed(2)} received (${e.bank || "-"} ${e.months || "-"} MONTHS @ ${e.ratePct}%) → Principal RM${e.principal.toFixed(2)} + Interest RM${e.interest.toFixed(2)}`,
+ qty: 1, rate: e.interest, amt: e.interest,
+ });
+ });
+ (c.pkg.discountEntries || []).forEach(e => {
+ const amt = Number(e.amount) || 0;
+ lines.push({ desc: `Discount: ${e.description || "-"} (RM${amt.toLocaleString()})`, qty: 1, rate: -amt, amt: -amt, isDiscount: true });
+ });
+
+ return { lines, total: computeSellingPrice(c.pkg) };
+}
+
+function billingLinesHtml(c) {
+ const { lines, total } = buildBillingLines(c);
+ const rows = lines.map(l => `
+ <tr>
+ <td style="padding:6px 8px;border:1px solid #ccc;font-size:12px;line-height:1.6;white-space:pre-line;vertical-align:top;${l.isDiscount ? "color:#C24141;" : ""}">${l.desc}</td>
+ <td style="padding:6px 8px;border:1px solid #ccc;text-align:center;font-size:12px;vertical-align:top;">${l.qty}</td>
+ <td style="padding:6px 8px;border:1px solid #ccc;text-align:right;font-size:12px;vertical-align:top;">${fmtNum(l.rate)}</td>
+ <td style="padding:6px 8px;border:1px solid #ccc;text-align:right;font-size:12px;font-weight:bold;vertical-align:top;${l.isDiscount ? "color:#C24141;" : ""}">${fmtNum(l.amt)}</td>
+ </tr>`).join("");
+ return `<table style="width:100%;border-collapse:collapse;margin-top:6px;">
+ <thead><tr style="background:#F5F3ED;">
+ <th style="padding:6px 8px;border:1px solid #ccc;text-align:left;font-size:11px;">DESCRIPTION</th>
+ <th style="padding:6px 8px;border:1px solid #ccc;font-size:11px;">QTY</th>
+ <th style="padding:6px 8px;border:1px solid #ccc;font-size:11px;">UNIT RATE (RM)</th>
+ <th style="padding:6px 8px;border:1px solid #ccc;font-size:11px;">AMOUNT (RM)</th>
+ </tr></thead>
+ <tbody>${rows}</tbody>
+ </table>
+ <div style="margin-top:10px;display:flex;justify-content:flex-end;">
+ <table style="border-collapse:collapse;">
+ <tr><td style="padding:8px 16px;font-weight:bold;font-size:13px;">TOTAL AMOUNT (RM)</td>
+ <td style="border:1.5px solid #1B2430;padding:8px 20px;font-weight:bold;font-size:14px;font-family:'IBM Plex Mono',monospace;">${fmtNum(total)}</td></tr>
+ </table>
+ </div>`;
+}
+
+function paymentBreakdownHtml(price, depositDate, packageType) {
+ if (packageType !== "Solar Package") {
+ // EV Charger Package / Other Package: simple 50% upfront, 50% on completion
+ return `<div style="font-size:13px;line-height:1.7;">
+ a. Initial payment (50%): ${fmtMoney(price * 0.50)}<br/>
+ b. Upon completion of job (50%): ${fmtMoney(price * 0.50)}
+ </div>`;
+ }
+ // Solar Package: company policy changed on 01/07/2026 (5%/60%/30% → 5%/75%/20%)
+ const useNewSplit = !depositDate || depositDate >= "2026-07-01";
+ const secondPct = useNewSplit ? 0.75 : 0.60;
+ const thirdPct = useNewSplit ? 0.20 : 0.30;
+ return `<div style="font-size:13px;line-height:1.7;">
+ a. Initial payment (5%): ${fmtMoney(price * 0.05)}<br/>
+ b. Upon SEDA approval (${Math.round(secondPct * 100)}%): ${fmtMoney(price * secondPct)}<br/>
+ c. Upon completion of installation (${Math.round(thirdPct * 100)}%): ${fmtMoney(price * thirdPct)}
+ </div>`;
+}
+
+function packageTypeBannerHtml(c) {
+ const color = PACKAGE_TYPE_COLORS[c.pkg.packageType] || "#0B2A4A";
+ const label = PACKAGE_TYPE_LABELS[c.pkg.packageType] || c.pkg.packageType;
+ return `<div style="background:${color};color:#fff;font-weight:bold;font-size:12.5px;padding:6px 12px;border-radius:6px;display:inline-block;margin-bottom:8px;">${label}</div>`;
+}
+// Full Name is kept as the SEDA applicant's name everywhere (search, SEDA/TNB reports, etc).
+// Billing documents are the one exception — when a separate "Billing Name" is set
+// (company / family member paying instead), the printed paperwork uses that name instead.
+function billTo(c) { return (c.billingName && c.billingName.trim()) ? c.billingName.trim() : (c.customerName || "-"); }
+
+function buildQuotationDoc(c) {
+ const price = Number(c.pkg.sellingPrice) || 0;
+ // Quotation number = the same CASE ID visible to Admin and Agent — names and cases always match up.
+ const qNo = "CASE-" + (c.caseNumber || c.id.slice(0, 6).toUpperCase());
+ const html = `${buildLetterheadHtml()}
+ <h1 style="font-size:18px;margin:14px 0 6px;">QUOTATION &nbsp; No.: ${qNo}</h1>
+ ${packageTypeBannerHtml(c)}
+ <p style="font-size:12.5px;line-height:1.7;">Customer: <b>${billTo(c)}</b><br/>
+ Tel: ${c.customerPhone || "-"} ${c.customerEmail ? " | " + c.customerEmail : ""}<br/>
+ Site Address: ${c.installAddress || "-"}<br/>
+ Date: ${fmtDate(todayISO())}</p>
+ ${billingLinesHtml(c)}
+ <div style="margin-top:14px;"><b style="font-size:13px;">Payment Term</b>${paymentBreakdownHtml(price, firstPaymentDate(c) || c.createdAt, c.pkg.packageType)}</div>
+ <p style="font-size:11px;color:#666;margin-top:16px;">This quotation is for reference only; final terms are subject to the formal agreement / invoice.</p>`;
+ return { title: `Quotation ${qNo}`, html };
+}
+
+function buildInvoiceDoc(c, amount, note, seq, logId) {
+ // The 4-char suffix is taken from this log entry's own unique internal ID — because that ID
+ // is already guaranteed never to repeat across any entry in the system, the combined number
+ // (sequential part + suffix) is absolutely unique even if two Agents hit generate at the
+ // exact same instant and happen to compute the same sequential number.
+ const suffix = logId ? logId.slice(-4).toUpperCase() : uid().slice(-4).toUpperCase();
+ const invNo = `SO-${String(seq).padStart(6, "0")}-${suffix}`;
+ const sorted = c.payment.records.slice().sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+ const histRows = sorted.map((r, i) => trHtml([i + 1, fmtDate(r.date), fmtMoney(r.amount), r.note || "-"])).join("");
+ const html = `${buildLetterheadHtml()}
+ <h1 style="font-size:18px;margin:14px 0 6px;">PROFORMA INVOICE &nbsp; No.: ${invNo}</h1>
+ ${packageTypeBannerHtml(c)}
+ <p style="font-size:12.5px;line-height:1.7;">Customer: <b>${billTo(c)}</b><br/>
+ Tel: ${c.customerPhone || "-"} ${c.customerEmail ? " | " + c.customerEmail : ""}<br/>
+ Site Address: ${c.installAddress || "-"}<br/>
+ ${c.tin ? "Customer TIN No. TIN:" + c.tin + "<br/>" : ""}
+ ${c.ic ? "IC / Passport No.: " + c.ic + "<br/>" : ""}
+ Date: ${fmtDate(todayISO())} &nbsp;|&nbsp; Terms: C.O.D.</p>
+ ${billingLinesHtml(c)}
+ <div style="margin-top:18px;background:#EAF4EE;border:1px solid #3C8C63;border-radius:8px;padding:14px 16px;">
+ ${note ? `<div style="font-size:12.5px;margin-bottom:8px;">Collection Note : <b>${note}</b></div>` :""}
+ <div style="font-size:11px;color:#3C8C63;font-weight:bold;letter-spacing:0.3px;">AMOUNT BEING COLLECTED NOW (Not the full package price)</div>
+ <div style="font-size:22px;font-weight:bold;font-family:'IBM Plex Mono',monospace;color:#1B5E3F;margin-top:4px;">RM ${fmtNum(amount)}</div>
+ </div>
+ ${histRows ? `<div style="margin-top:18px;font-size:11px;color:#666;">Payment History </div>${styledTable(["#", "Date", "Amount", "Note"], histRows)}` : ""}
+ <p style="font-size:11px;color:#666;margin-top:16px;">Payable to: ETERNALGY SDN BHD, Maybank account: 501534157918.<br/>
+ Goods sold will only be released upon full payment of this invoice (no consignment / outstanding balance permitted). Goods sold are not returnable or refundable.</p>`;
+ return { title: `Proforma Invoice ${invNo}`, html };
+}
+
+function buildDeliveryOrderDoc(c) {
+ const doNo = c.delivery.doNumber || `DO-${todayISO().replace(/-/g, "").slice(2, 8)}${String(seqFromId(c.id + "do", 999)).padStart(3, "0")}`;
+ const d = c.delivery;
+ const displayItem = (it) => {
+ if (it.name === "Solar Panel" && !it.qty && !it.model) {
+ return { ...it, qty: c.pkg.panelCount || "", model: c.pkg.panelModel || (c.pkg.panelSizeW ? `${c.pkg.panelSizeW}W` : "") };
+ }
+ if (it.name === "Inverter" && !it.qty && !it.model) {
+ return { ...it, qty: "1", model: c.pkg.inverterModel || "" };
+ }
+ return it;
+ };
+ const rowHtml = (it, i, highlight) => `<tr${highlight ? ' style="background:#FFF6DA;"' : ""}>
+ <td style="padding:5px 8px;border:1px solid #ccc;${highlight ? "font-weight:bold;" : ""}">${i}. ${it.name || "-"}</td>
+ <td style="padding:5px 8px;border:1px solid #ccc;text-align:center;color:#2C5F8A;">${it.model || "-"}</td>
+ <td style="padding:5px 8px;border:1px solid #ccc;text-align:center;color:#2C5F8A;font-weight:bold;">${it.qty || "-"}</td>
+ <td style="padding:5px 8px;border:1px solid #ccc;text-align:center;">☐</td>
+ <td style="padding:5px 8px;border:1px solid #ccc;text-align:center;">☐</td>
+ <td style="padding:5px 8px;border:1px solid #ccc;text-align:center;">☐</td>
+ </tr>`;
+
+ // Solar Panel / Inverter auto-fill rows only apply to Solar Package; any item Admin manually
+ // added is always printed, so EV/Other packages can still list their own DO items.
+ const manualRows = d.items
+ .filter(it => c.pkg.packageType === "Solar Package" || (it.name !== "Solar Panel" && it.name !== "Inverter"))
+ .map(displayItem);
+
+ // Battery/EV Charger are priced goods, not services — auto-inject them here from the Package/Install
+ // data directly (regardless of whether Admin remembered to add them to the manual item list above),
+ // so warehouse staff can never miss loading them for delivery.
+ const autoItems = [];
+ // Extra inverter units (the "Add Another Inverter" entries) are real hardware that has to be
+ // loaded — the fixed checklist above only has a single Inverter row, so add the rest here.
+ (c.pkg.inverterEntries || []).forEach(e => {
+ if (e.model) autoItems.push({ name: "Inverter (Add-on)", model: e.model, qty: e.qty || 1 });
+ });
+ if (c.pkg.packageType === "Solar Package" && c.pkg.battery.model) {
+ autoItems.push({ name: "Battery (Add-on)", model: c.pkg.battery.model, qty: c.pkg.battery.qty || 1 });
+ }
+ if (c.pkg.packageType === "EV Charger Package" && c.pkg.evCharger.model && suppliesGoods(c)) {
+ autoItems.push({ name: "EV Charger (Add-on)", model: c.pkg.evCharger.model, qty: c.pkg.evCharger.qty || 1 });
+ }
+ if (c.install.ev.applicable && c.install.ev.model && suppliesGoods(c)) autoItems.push({ name: "EV Charger (Add-on)", model: c.install.ev.model, qty: c.install.ev.qty || 1 });
+ if (c.install.capBank.applicable && c.install.capBank.model) autoItems.push({ name: "Cap Bank (Add-on)", model: c.install.capBank.model, qty: c.install.capBank.qty || 1 });
+ // Freeform "Other" entries in Package Details (e.g. Ballast System) are billed add-on
+ // goods too — they must ship with the order, so they're auto-injected here the same way,
+ // instead of relying on staff remembering to re-type them into the manual DO checklist.
+ (c.pkg.otherEntries || []).forEach(e => {
+ if (e.name) autoItems.push({ name: `${e.name} (Add-on)`, model: "", qty: e.qty || 1 });
+ });
+
+ const itemRows = manualRows.map((it, i) => rowHtml(it, i + 1, false)).join("")
+ + autoItems.map((it, i) => rowHtml(it, manualRows.length + i + 1, true)).join("");
+
+ const html = `
+ <div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #0B2A4A;padding-bottom:10px;">
+ <div>
+ <div style="font-weight:bold;font-size:15px;color:#0B2A4A;">ETERNALGY SDN. BHD.</div>
+ <div style="font-size:10px;color:#666;line-height:1.5;">23-01 JALAN MUTIARA EMAS 10/19 TAMAN MOUNT AUSTIN<br/>81100 JOHOR BAHRU JOHOR MALAYSIA</div>
+ </div>
+ <div style="text-align:right;">
+ <div style="font-size:11px;color:#666;">Delivery Order</div>
+ <div style="font-size:13px;font-weight:bold;">No. <span style="color:#C24141;">${doNo}</span></div>
+ <div style="font-size:10px;color:#999;">rev.0</div>
+ </div>
+ </div>
+
+ ${packageTypeBannerHtml(c)}
+ <div style="margin-top:14px;font-weight:bold;font-size:12.5px;">A. CLIENT INFORMATION</div>
+ <table style="width:100%;font-size:12px;margin-top:4px;border-collapse:collapse;">
+ <tr><td style="width:150px;color:#666;padding:3px 0;">Customer Name</td><td style="font-weight:bold;">${c.customerName || "-"}${c.pkg.packageType === "Solar Package" ? ` (${c.pkg.systemType})` : ""}</td></tr>
+ <tr><td style="color:#666;padding:3px 0;">Service Agent</td><td>${agentDisplay(c)}</td></tr>
+ <tr><td style="color:#666;padding:3px 0;">Contact number</td><td>${c.customerPhone || "-"}</td></tr>
+ <tr><td style="color:#666;padding:3px 0;">Installation Date</td><td><b>${c.install.deliveryDate ? fmtDate(c.install.deliveryDate) : "-"}${d.installTimeSlot ? ` &nbsp;-&nbsp; ${d.installTimeSlot}` : ""}${d.installTime ? ` @${d.installTime}` : ""}</b></td></tr>
+ <tr><td style="color:#666;padding:3px 0;">Installation Address</td><td>${c.installAddress || "-"}</td></tr>
+ <tr><td style="color:#666;padding:3px 0;">Delivery Address</td><td>${d.deliveryAddressSame ? "same as above" : (d.deliveryAddress || "-")}</td></tr>
+ <tr><td style="color:#666;padding:3px 0;">Remarks</td><td>${d.remarks || "-"}</td></tr>
+ </table>
+
+ <div style="margin-top:16px;font-weight:bold;font-size:12.5px;">B. Delivery Details</div>
+ <table style="width:100%;font-size:12px;margin-top:4px;border-collapse:collapse;">
+ <tr>
+ <td style="width:140px;color:#666;padding:3px 0;">Delivery Pick up</td><td>${d.pickupDateTime || "-"}</td>
+ <td style="width:110px;color:#666;padding:3px 0;">Driver name</td><td>${d.driverName || "-"}</td>
+ </tr>
+ <tr>
+ <td style="color:#666;padding:3px 0;">Delivery Date</td><td>${d.deliveryDate ? fmtDate(d.deliveryDate) : "-"}</td>
+ <td style="color:#666;padding:3px 0;">Driver Phone</td><td>${d.driverPhone || "-"}</td>
+ </tr>
+ <tr>
+ <td style="color:#666;padding:3px 0;">Delivery Time</td><td>${d.deliveryTimeStart || "-"} - ${d.deliveryTimeEnd || "-"}</td>
+ <td style="color:#666;padding:3px 0;">Lorry no.</td><td>${d.lorryNo || "-"}</td>
+ </tr>
+ </table>
+
+ <div style="margin-top:14px;font-weight:bold;font-size:12.5px;">Deliver Items List</div>
+ <table style="width:100%;border-collapse:collapse;font-size:11.5px;margin-top:4px;">
+ <thead>
+ <tr style="background:#F5F3ED;">
+ <th style="padding:6px 8px;border:1px solid #ccc;text-align:left;">Product Name</th>
+ <th style="padding:6px 8px;border:1px solid #ccc;">Model / Spec</th>
+ <th style="padding:6px 8px;border:1px solid #ccc;">Quantity</th>
+ <th style="padding:6px 8px;border:1px solid #ccc;">Packer</th>
+ <th style="padding:6px 8px;border:1px solid #ccc;">Driver</th>
+ <th style="padding:6px 8px;border:1px solid #ccc;">Recipient</th>
+ </tr>
+ </thead>
+ <tbody>${itemRows}</tbody>
+ </table>
+
+ <table style="width:100%;font-size:11.5px;margin-top:10px;">
+ <tr>
+ <td style="color:#666;padding:3px 0;width:150px;">Material Planner</td><td style="font-weight:bold;">${d.materialPlanner || "-"}</td>
+ <td style="color:#666;padding:3px 0;width:150px;">Warehouse Manager</td><td style="font-weight:bold;">${d.warehouseManager || "-"}</td>
+ </tr>
+ <tr>
+ <td style="color:#666;padding:3px 0;">Date</td><td>${d.materialPlannerDate ? fmtDate(d.materialPlannerDate) : "-"}</td>
+ <td style="color:#666;padding:3px 0;">Date</td><td>${d.warehouseManagerDate ? fmtDate(d.warehouseManagerDate) : "-"}</td>
+ </tr>
+ </table>
+
+ <div style="margin-top:18px;font-weight:bold;font-size:12.5px;">Acknowledgement</div>
+ <table style="width:100%;border-collapse:collapse;margin-top:6px;font-size:11.5px;">
+ <tr style="background:#F5F3ED;">
+ <th style="padding:6px;border:1px solid #ccc;width:33%;">Packer</th>
+ <th style="padding:6px;border:1px solid #ccc;width:33%;">Deliver</th>
+ <th style="padding:6px;border:1px solid #ccc;width:34%;">Recipient</th>
+ </tr>
+ <tr>
+ <td style="border:1px solid #ccc;height:56px;vertical-align:bottom;padding:4px;">Sign:</td>
+ <td style="border:1px solid #ccc;height:56px;vertical-align:bottom;padding:4px;">Sign:</td>
+ <td style="border:1px solid #ccc;height:56px;vertical-align:bottom;padding:4px;">Sign:<br/><span style="font-size:9px;color:#999;">(Company Stamp if applicable)</span></td>
+ </tr>
+ <tr>
+ <td style="border:1px solid #ccc;padding:4px;">Name:</td>
+ <td style="border:1px solid #ccc;padding:4px;">Name: ${d.driverName || ""}</td>
+ <td style="border:1px solid #ccc;padding:4px;">Name:</td>
+ </tr>
+ <tr>
+ <td style="border:1px solid #ccc;padding:4px;">Date:</td>
+ <td style="border:1px solid #ccc;padding:4px;">Date:</td>
+ <td style="border:1px solid #ccc;padding:4px;">Date:</td>
+ </tr>
+ </table>
+ <div style="margin-top:10px;font-size:10.5px;color:#666;">This delivery note serves as proof of delivery. Please check and sign upon receipt.</div>`;
+ return { title: `Delivery Order ${doNo}`, html };
+}
+
+function buildAgentFullListReportDoc(cases) {
+ const sorted = cases.slice().sort((a, b) => (firstPaymentDate(a) || a.createdAt || "").localeCompare(firstPaymentDate(b) || b.createdAt || ""));
+ const rows = sorted.map(c => {
+ const price = Number(c.pkg.sellingPrice) || 0;
+ const collected = paymentTotal(c);
+ const balance = price - collected;
+ const pct = paymentPercent(c);
+ const stage = stageOf(c);
+ const cancelled = c.cancellation && c.cancellation.isCancelled;
+ const pkgLabel = c.pkg.packageType === "Solar Package" ? `Solar (${c.pkg.systemType})` : c.pkg.packageType === "EV Charger Package" ? "EV Charger" : "Other";
+ return trHtml([
+ c.customerName || "-",
+ c.pkg.propertyType,
+ pkgLabel,
+ firstPaymentDate(c) ? fmtDate(firstPaymentDate(c)) : "No Deposit",
+ `${pct}%`,
+ fmtMoney(collected),
+ fmtMoney(balance),
+ cancelled ? `Cancelled ${c.cancellation.cancelDate ? fmtDate(c.cancellation.cancelDate) : ""}` : `${stage.label} ${stage.en}`,
+ ], cancelled ? "background:#FBEAEA;color:#8B3A3A;" : "");
+ }).join("");
+ const totalValue = sorted.reduce((s, c) => s + (Number(c.pkg.sellingPrice) || 0), 0);
+ const totalCollected = sorted.reduce((s, c) => s + paymentTotal(c), 0);
+ const agentName = sorted.length ? agentDisplay(sorted[0]) : "-";
+ const today = fmtDate(new Date().toISOString().slice(0, 10));
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Agent Full Case List &nbsp;—&nbsp; ${today}</h1>
+ <div style="font-size:12px;color:#666;margin-bottom:8px;">Agent: <b>${agentName}</b> &nbsp;|&nbsp; ${sorted.length} cases (All cases regardless of date or payment status)</div>
+ ${styledTable(["Customer", "Property", "Package", "Deposit Date", "Payment %", "Collected", "Balance", "Status"], rows || trHtml(["No cases","","","","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;">Total Value: ${fmtMoney(totalValue)} &nbsp;|&nbsp; Total Collected: ${fmtMoney(totalCollected)} &nbsp;|&nbsp; Balance: ${fmtMoney(totalValue - totalCollected)}</div>`;
+ return { title: `Agent Full Case List ${agentName} ${today}`, html };
+}
+
+function buildDepositReportDoc(startDate, endDate, cases) {
+ const list = cases.filter(c => {
+ if (!inRange(firstPaymentDate(c), startDate, endDate)) return false;
+ const cancelled = c.cancellation && c.cancellation.isCancelled;
+ if (cancelled) return true; // cancelled cases always show here (with the cancel date), regardless of how far payment got
+ // If this case's payment also crossed 60%/80%/100% within this same date range, it belongs
+ // to that threshold report instead — keeps a case from double-counting in both reports.
+ return !highestThresholdCrossedInRange(c, startDate, endDate);
+ });
+ const rows = list.map(c => {
+ const first = c.payment.records.slice().sort((a, b) => (a.date || "").localeCompare(b.date || ""))[0];
+ const cancelled = c.cancellation && c.cancellation.isCancelled;
+ const status = cancelled ? `Cancelled ${c.cancellation.cancelDate ? fmtDate(c.cancellation.cancelDate) : ""}` : "-";
+ return trHtml([c.customerName || "-", agentDisplay(c), c.pkg.propertyType, first ? fmtDate(first.date) : "-", fmtMoney(first ? first.amount : 0), fmtMoney(c.pkg.sellingPrice), status], cancelled ? `background:#FBEAEA;color:#8B3A3A;` : "");
+ }).join("");
+ const total = list.reduce((s, c) => {
+ const first = c.payment.records.slice().sort((a, b) => (a.date || "").localeCompare(b.date || ""))[0];
+ return s + (Number(first ? first.amount : 0) || 0);
+ }, 0);
+ const cancelledCount = list.filter(c => c.cancellation && c.cancellation.isCancelled).length;
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Deposit Report &nbsp;—&nbsp; ${dateRangeLabel(startDate, endDate)}</h1>
+ ${styledTable(["Customer", "Agent", "Property", "Deposit Date", "Deposit Amount", "Price", "Status"], rows || trHtml(["No cases","","","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;"> case ${list.length} &nbsp;|&nbsp; ${fmtMoney(total)}${cancelledCount ? ` &nbsp;|&nbsp; ${cancelledCount} ` :""}</div>`;
+ return { title: `Deposit Report ${startDate}~${endDate}`, html };
+}
+
+function buildInstallReportDoc(startDate, endDate, cases) {
+ // For Solar Package: include cases where at least one component is done within the range,
+ // even if others are still pending — flag the pending ones clearly in the report.
+ // For EV/Other Package: include if any component is done and lastInstallDate falls in range.
+ const list = cases.filter(c => {
+ const hasAnyDate = installApplicableItems(c).some(k => c.install[k].date);
+ return hasAnyDate && inRange(lastInstallDate(c), startDate, endDate);
+ });
+ const rows = list.map(c => {
+ const price = Number(c.pkg.sellingPrice) || 0;
+ const collected = paymentTotal(c);
+ const balance = price - collected;
+ const instDate = lastInstallDate(c);
+ const pending = installPendingItems(c);
+ const remarks = [
+ c.payment.isLoanCase ? "Case Loan Case" : "",
+ pending.length ? `⚠️ Still pending: ${pending.join(", ")}` : "",
+ ].filter(Boolean).join("　|　") || "-";
+ return trHtml([
+ c.customerName || "-", agentDisplay(c), c.pkg.propertyType, instDate ? fmtDateFull(instDate) : "-",
+ c.pkg.packageType === "Solar Package" ? `${c.pkg.panelCount || "-"} / ${c.pkg.panelSizeW || "-"}W` : c.pkg.packageType,
+ fmtMoney(price), fmtMoney(collected), fmtMoney(balance),
+ remarks,
+ ], pending.length ? "background:#FFF6E8;color:#8A6416;" : "");
+ }).join("");
+ const totalPrice = list.reduce((s, c) => s + (Number(c.pkg.sellingPrice) || 0), 0);
+ const totalCollected = list.reduce((s, c) => s + paymentTotal(c), 0);
+ const totalBalance = totalPrice - totalCollected;
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Installation Report &nbsp;—&nbsp; ${dateRangeLabel(startDate, endDate)}</h1>
+ ${styledTable(["Customer", "Agent", "Property", "Install Date", "Panel Spec", "Price", "Collected", "Balance", "Remark"], rows || trHtml(["No cases","","","","","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;">Installed Cases: ${list.length} &nbsp;|&nbsp; Total Value: ${fmtMoney(totalPrice)} &nbsp;|&nbsp; Total Collected: ${fmtMoney(totalCollected)} &nbsp;|&nbsp; Balance: ${fmtMoney(totalBalance)}</div>`;
+ return { title: `Installation Report ${startDate}~${endDate}`, html };
+}
+
+function buildOutstandingAfterInstallReportDoc(cases) {
+ const list = cases.filter(c =>
+ installComplete(c) && !(c.cancellation && c.cancellation.isCancelled) &&
+ (Number(c.pkg.sellingPrice) || 0) - paymentTotal(c) > 0
+ );
+ list.sort((a, b) => (lastInstallDate(a) || "").localeCompare(lastInstallDate(b) || ""));
+ const rows = list.map(c => {
+ const price = Number(c.pkg.sellingPrice) || 0;
+ const collected = paymentTotal(c);
+ const balance = price - collected;
+ const instDate = lastInstallDate(c);
+ const lastPay = lastPaymentDate(c);
+ const openOM = (c.om.records || []).filter(r => !r.resolvedDate);
+ const hasWelcome = !!c.tnb.welcomeDate;
+ // Loan cases waiting on the bank to disburse aren't "refusing to pay" — exclude them from
+ // the deadbeat/shutdown flag, and label them clearly instead so they don't get chased like
+ // a normal unpaid case.
+ const flagShutdown = hasWelcome && openOM.length === 0 && !c.payment.isLoanCase;
+ const omStatus = openOM.length
+ ? `Open O&M: ${openOM.map(r => `${r.issueType}${ISSUE_TYPE_EN[r.issueType] ? " " + ISSUE_TYPE_EN[r.issueType] : ""} ${fmtDate(r.reportDate)} `).join(", ")}`
+ : "None";
+ const remark = c.payment.isLoanCase
+ ? `Loan Case (${c.payment.loReceivedDate ? "LO LO received, awaiting disbursement" : "LO LO not received"})`
+ : (flagShutdown ? "Inverter Can Consider Shutdown" : "-");
+ return trHtml([
+ c.customerName || "-", agentDisplay(c), instDate ? fmtDate(instDate) : "-",
+ hasWelcome ? fmtDate(c.tnb.welcomeDate) : "Not Received",
+ fmtMoney(price), fmtMoney(collected), fmtMoney(balance),
+ lastPay ? fmtDate(lastPay) : "No Payment Yet",
+ omStatus,
+ remark,
+ ], flagShutdown ? "background:#FBEAEA;color:#8B3A3A;" : openOM.length ? "background:#FFF6E8;color:#8A6416;" : c.payment.isLoanCase ? "background:#F0F6FB;color:#2C5F8A;" : "");
+ }).join("");
+ const totalBalance = list.reduce((s, c) => s + ((Number(c.pkg.sellingPrice) || 0) - paymentTotal(c)), 0);
+ const withOpenOM = list.filter(c => (c.om.records || []).some(r => !r.resolvedDate)).length;
+ const shutdownCandidates = list.filter(c => c.tnb.welcomeDate && !(c.om.records || []).some(r => !r.resolvedDate) && !c.payment.isLoanCase).length;
+ const loanCount = list.filter(c => c.payment.isLoanCase).length;
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Installed but Not Fully Paid &nbsp;—&nbsp; ${fmtDate(new Date().toISOString().slice(0,10))}</h1>
+ ${styledTable(["Customer", "Agent", "Install Date", "Welcome Letter Date", "Price", "Collected", "Balance", "Last Payment", "O&M Status", "Remark"], rows || trHtml(["No cases","","","","","","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;"> ${list.length} case &nbsp;|&nbsp; Balance${fmtMoney(totalBalance)} &nbsp;|&nbsp; ${withOpenOM} O&M highlight&nbsp;|&nbsp; ${shutdownCandidates} Welcome Letter O&M highlight/ Inverter&nbsp;|&nbsp; ${loanCount} Casehighlight/</div>
+ <div style="margin-top:8px;font-size:11px;color:#666;">*<br/>*O&M Inverter= TNB Welcome Letter O&M Case Case /</div>`;
+ return { title: `Installed but Not Fully Paid ${fmtDate(new Date().toISOString().slice(0,10))}`, html };
+}
+
+function buildShipmentReportDoc(startDate, endDate, cases, itemDirectory) {
+ const panelRows = {};
+ cases.forEach(c => {
+ if (c.install.panel.applicable && inRange(c.install.panel.date, startDate, endDate)) {
+ const size = c.pkg.panelSizeW || "Not Specified";
+ const qty = Number(c.pkg.panelCount) || 0;
+ if (!panelRows[size]) panelRows[size] = { total: 0, byType: {} };
+ panelRows[size].total += qty;
+ const t = c.pkg.propertyType || "Other";
+ panelRows[size].byType[t] = (panelRows[size].byType[t] || 0) + qty;
+ }
+ });
+ const panelSizes = Object.keys(panelRows).sort((a, b) => Number(a) - Number(b));
+ const panelTableRows = panelSizes.map(size => {
+ const r = panelRows[size];
+ return trHtml([`${size}W`, ...PROPERTY_TYPES.map(p => r.byType[p.v] || 0), r.total]);
+ }).join("");
+ const panelTotal = panelSizes.reduce((s, size) => s + panelRows[size].total, 0);
+
+ const invRows = {};
+ cases.forEach(c => {
+ if (c.install.inverter.applicable && inRange(c.install.inverter.date, startDate, endDate)) {
+ const model = c.pkg.inverterModel || "No Model";
+ invRows[model] = (invRows[model] || 0) + 1;
+ (c.pkg.inverterEntries || []).forEach(e => {
+ if (e.model) invRows[e.model] = (invRows[e.model] || 0) + (Number(e.qty) || 1);
+ });
+ }
+ });
+ const invTableRows = Object.entries(invRows).map(([model, qty]) => trHtml([model, qty])).join("");
+ const invTotal = Object.values(invRows).reduce((s, n) => s + n, 0);
+
+ const battRows = {};
+ cases.forEach(c => {
+ if (c.install.battery.applicable && inRange(c.install.battery.date, startDate, endDate)) {
+ const model = (c.pkg.battery && c.pkg.battery.model) || c.install.battery.model || "No Model";
+ const qty = Number((c.pkg.battery && c.pkg.battery.qty) || c.install.battery.qty) || 1;
+ battRows[model] = (battRows[model] || 0) + qty;
+ }
+ });
+ const battTableRows = Object.entries(battRows).map(([model, qty]) => trHtml([model, qty])).join("");
+ const battTotal = Object.values(battRows).reduce((s, n) => s + n, 0);
+
+ const evRows = {};
+ cases.forEach(c => {
+ if (c.install.ev.applicable && inRange(c.install.ev.date, startDate, endDate)) {
+ const model = (c.pkg.evCharger && c.pkg.evCharger.model) || c.install.ev.model || "No Model";
+ const qty = Number((c.pkg.evCharger && c.pkg.evCharger.qty) || c.install.ev.qty) || 1;
+ evRows[model] = (evRows[model] || 0) + qty;
+ }
+ });
+ const evTableRows = Object.entries(evRows).map(([model, qty]) => trHtml([model, qty])).join("");
+ const evTotal = Object.values(evRows).reduce((s, n) => s + n, 0);
+
+ const capRows = {};
+ cases.forEach(c => {
+ if (c.install.capBank.applicable && inRange(c.install.capBank.date, startDate, endDate)) {
+ const model = c.install.capBank.model || "No Model";
+ const qty = Number(c.install.capBank.qty) || 1;
+ capRows[model] = (capRows[model] || 0) + qty;
+ }
+ });
+ const capTableRows = Object.entries(capRows).map(([model, qty]) => trHtml([model, qty])).join("");
+ const capTotal = Object.values(capRows).reduce((s, n) => s + n, 0);
+
+ // Current stock level (all-time, not limited to the report's date range) — only shown when
+ // an Item Directory is supplied and at least one item has stock-in records logged.
+ let stockSection = "";
+ if (itemDirectory && itemDirectory.length) {
+ const shippedMap = computeShippedByModel(cases);
+ const trackedItems = itemDirectory.filter(it => (it.stockIns || []).length > 0);
+ if (trackedItems.length) {
+ const stockTableRows = trackedItems.map(it => {
+ const s = computeItemStock(it, shippedMap);
+ return trHtml([it.category, it.name, s.stockIn, s.shipped, s.remaining]);
+ }).join("");
+ stockSection = `
+ <div style="font-weight:bold;font-size:13px;margin-top:18px;">Current Stock Level (All-time, not limited by date range)</div>
+ ${styledTable(["Category", "Model", "Stock In", "Shipped", "Remaining"], stockTableRows)}`;
+ }
+ }
+
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Shipment Report &nbsp;—&nbsp; ${dateRangeLabel(startDate, endDate)}</h1>
+ <div style="font-weight:bold;font-size:13px;margin-top:10px;"> Solar Panel By install date</div>
+ ${styledTable(["Size", ...PROPERTY_TYPES.map(p => `${p.en}`), "Total (pcs)"], panelTableRows || trHtml(["No shipments in this range", "", "", "", "", "", ""]))}
+ <div style="margin-top:6px;font-size:12.5px;"> Total Panels${panelTotal} </div>
+
+ <div style="font-weight:bold;font-size:13px;margin-top:18px;">Inverter </div>
+ ${styledTable(["Model", "Qty"], invTableRows || trHtml(["No shipments in this range", ""]))}
+ <div style="margin-top:6px;font-size:12.5px;">Inverter Total${invTotal} </div>
+
+ <div style="font-weight:bold;font-size:13px;margin-top:18px;">Battery </div>
+ ${styledTable(["Model", "Qty"], battTableRows || trHtml(["No shipments in this range", ""]))}
+ <div style="margin-top:6px;font-size:12.5px;">Battery Total${battTotal} </div>
+
+ <div style="font-weight:bold;font-size:13px;margin-top:18px;">EV Charger </div>
+ ${styledTable(["Model", "Qty"], evTableRows || trHtml(["No shipments in this range", ""]))}
+ <div style="margin-top:6px;font-size:12.5px;">EV Charger Total${evTotal} </div>
+
+ <div style="font-weight:bold;font-size:13px;margin-top:18px;">Cap Bank </div>
+ ${styledTable(["Model", "Qty"], capTableRows || trHtml(["No shipments in this range", ""]))}
+ <div style="margin-top:6px;font-size:12.5px;">Cap Bank Total${capTotal} </div>
+ ${stockSection}
+ <div style="margin-top:12px;font-size:11px;color:#666;">* case /<br/>*Based on each component's install date; quantities are per case. Current stock is calculated from the model selected in Package Details/Install Status, matched against Stock In records in Item Directory.</div>`;
+ return { title: `Shipment Report ${startDate}~${endDate}`, html };
+}
+
+function buildWeeklyShipmentDoc(startDate, endDate, cases) {
+ const inRange = (d) => d && d >= startDate && d <= endDate;
+ const componentKeys = ["panel", "inverter", "wiring", "battery", "ev", "mounting", "electrical"];
+
+ const customersInRange = cases.filter(c => componentKeys.some(k => c.install[k].applicable && inRange(c.install[k].date)));
+ const customerRows = customersInRange.map(c => trHtml([
+ c.customerName || "-", c.pkg.propertyType, agentDisplay(c),
+ `${c.pkg.panelCount || "-"} / ${c.pkg.panelSizeW || "-"}W`,
+ c.pkg.inverterModel || "-",
+ ])).join("");
+
+ const fmtDates = (set) => set.size ? Array.from(set).sort().map(fmtDate).join(", ") : "-";
+
+ const panelDates = new Set(); let panelTotal = 0;
+ cases.forEach(c => { if (c.install.panel.applicable && inRange(c.install.panel.date)) { panelDates.add(c.install.panel.date); panelTotal += Number(c.pkg.panelCount) || 0; } });
+
+ const invRows = {}; const invDates = new Set();
+ cases.forEach(c => { if (c.install.inverter.applicable && inRange(c.install.inverter.date)) { invDates.add(c.install.inverter.date); const m = c.pkg.inverterModel || "Not Specified"; invRows[m] = (invRows[m] || 0) + 1; } });
+
+ const battRows = {}; const battDates = new Set();
+ cases.forEach(c => { if (c.install.battery.applicable && inRange(c.install.battery.date)) { battDates.add(c.install.battery.date); const m = c.install.battery.model || "Not Specified"; const q = Number(c.install.battery.qty) || 1; battRows[m] = (battRows[m] || 0) + q; } });
+
+ const evRows = {}; const evDates = new Set();
+ cases.forEach(c => { if (c.install.ev.applicable && inRange(c.install.ev.date)) { evDates.add(c.install.ev.date); const m = c.install.ev.model || "Not Specified"; const q = Number(c.install.ev.qty) || 1; evRows[m] = (evRows[m] || 0) + q; } });
+
+ const mountingDates = new Set(); let mountingCount = 0;
+ cases.forEach(c => { if (c.install.mounting.applicable && inRange(c.install.mounting.date)) { mountingDates.add(c.install.mounting.date); mountingCount++; } });
+
+ const electricalDates = new Set(); let electricalCount = 0;
+ cases.forEach(c => { if (c.install.electrical.applicable && inRange(c.install.electrical.date)) { electricalDates.add(c.install.electrical.date); electricalCount++; } });
+
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Weekly Shipment Progress &nbsp;—&nbsp; ${fmtDate(startDate)} - ${fmtDate(endDate)}</h1>
+
+ <div style="font-weight:bold;font-size:13px;margin-top:10px;"> Customers This Week</div>
+ ${styledTable(["Customer", "Property", "Agent", "Panel", "Inverter"], customerRows || trHtml(["No records this week", "", "", "", ""]))}
+ <div style="margin-top:6px;font-size:12.5px;"> Count${customersInRange.length}</div>
+
+ <div style="font-weight:bold;font-size:13px;margin-top:18px;">Panel</div>
+ <div style="font-size:12.5px;"> Sold Date${fmtDates(panelDates)} &nbsp;|&nbsp; Total${panelTotal} pcs</div>
+
+ <div style="font-weight:bold;font-size:13px;margin-top:18px;">Inverter</div>
+ <div style="font-size:12.5px;margin-bottom:4px;"> Sold Date${fmtDates(invDates)}</div>
+ ${styledTable(["Model", "Qty"], Object.entries(invRows).map(([m, q]) => trHtml([m, q])).join("") || trHtml(["No shipments", ""]))}
+
+ <div style="font-weight:bold;font-size:13px;margin-top:18px;">Battery</div>
+ <div style="font-size:12.5px;margin-bottom:4px;"> Sold Date${fmtDates(battDates)}</div>
+ ${styledTable(["Model", "Qty"], Object.entries(battRows).map(([m, q]) => trHtml([m, q])).join("") || trHtml(["No shipments", ""]))}
+
+ <div style="font-weight:bold;font-size:13px;margin-top:18px;">EV Charger</div>
+ <div style="font-size:12.5px;margin-bottom:4px;"> Sold Date${fmtDates(evDates)}</div>
+ ${styledTable(["Model", "Qty"], Object.entries(evRows).map(([m, q]) => trHtml([m, q])).join("") || trHtml(["No shipments", ""]))}
+
+ <div style="font-weight:bold;font-size:13px;margin-top:18px;">Mounting Structure</div>
+ <div style="font-size:12.5px;"> Sold Date${fmtDates(mountingDates)} &nbsp;|&nbsp; Count${mountingCount} </div>
+
+ <div style="font-weight:bold;font-size:13px;margin-top:18px;">Electric Item</div>
+ <div style="font-size:12.5px;"> Sold Date${fmtDates(electricalDates)} &nbsp;|&nbsp; Count${electricalCount} </div>`;
+ return { title: `Weekly Shipment Progress ${startDate}~${endDate}`, html };
+}
+
+function buildPendingLoReportDoc(cases) {
+ const list = cases.filter(c =>
+ c.payment.isLoanCase &&
+ !(c.cancellation && c.cancellation.isCancelled) &&
+ !c.payment.loReceivedDate
+ );
+ const today = todayISO();
+ const daysBetween = (a, b) => Math.floor((new Date(b) - new Date(a)) / 86400000);
+ const withDays = list.map(c => ({ c, depositDate: firstPaymentDate(c), days: firstPaymentDate(c) ? daysBetween(firstPaymentDate(c), today) : 0 }));
+ withDays.sort((a, b) => (a.depositDate || "").localeCompare(b.depositDate || ""));
+ const rows = withDays.map(x => trHtml(
+ [x.c.customerName || "-", agentDisplay(x.c), x.depositDate ? fmtDate(x.depositDate) : "-", `${x.days} days`, x.c.payment.loanBank || "-", x.c.payment.loanApprovedAmount ? fmtMoney(x.c.payment.loanApprovedAmount) : "-", fmtMoney(x.c.pkg.sellingPrice)],
+ x.days >= 14 ? "background:#FBEAEA;color:#8B3A3A;" : x.days >= 7 ? "background:#FFF6E8;color:#8A6416;" : ""
+ )).join("");
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Pending Letter of Offer &nbsp;—&nbsp; ${fmtDate(today)}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">* Case Deposit LO case —— 14 highlight7 /Agent <br/>Loan cases with a deposit collected but no Letter of Offer yet — can't schedule install until received. Oldest first; 14+ days in red, 7+ days in orange.</div>
+ ${styledTable(["Customer", "Agent", "Deposit Date", "Waiting", "Bank", "Approved", "Price"], rows || trHtml(["LO case No cases pending","","","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;"> Total${list.length}</div>`;
+ return { title: `Pending Letter of Offer ${fmtDate(today)}`, html };
+}
+
+function buildPendingSedaSubmissionReportDoc(cases) {
+ const list = cases.filter(c =>
+ c.pkg.packageType === "Solar Package" &&
+ !skipsSedaTnb(c) &&
+ !(c.cancellation && c.cancellation.isCancelled) &&
+ paymentTotal(c) > 0 &&
+ !c.seda.submitDate
+ );
+ const today = todayISO();
+ const daysBetween = (a, b) => Math.floor((new Date(b) - new Date(a)) / 86400000);
+ const withDays = list.map(c => ({ c, depositDate: firstPaymentDate(c), days: firstPaymentDate(c) ? daysBetween(firstPaymentDate(c), today) : 0 }));
+ withDays.sort((a, b) => (a.depositDate || "").localeCompare(b.depositDate || ""));
+ const rows = withDays.map(x => trHtml(
+ [x.c.customerName || "-", agentDisplay(x.c), x.depositDate ? fmtDate(x.depositDate) : "-", `${x.days} days`, x.c.pkg.region || "-"],
+ x.days >= 14 ? "background:#FBEAEA;color:#8B3A3A;" : x.days >= 7 ? "background:#FFF6E8;color:#8A6416;" : ""
+ )).join("");
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Pending SEDA Submission &nbsp;—&nbsp; ${fmtDate(today)}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">* SEDA caseSolar Package —— 14 highlight7 Agent <br/>Cases with a deposit collected but SEDA not yet submitted, oldest first. 14+ days in red, 7+ days in orange.</div>
+ ${styledTable(["Customer", "Agent", "Deposit Date", "Waiting", "Region"], rows || trHtml(["SEDA case No cases pending","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;"> Total${list.length}</div>`;
+ return { title: `Pending SEDA Submission ${fmtDate(today)}`, html };
+}
+
+// Applied to SEDA but still waiting on their approval — the ball is in SEDA's court, so this is
+// the list to chase them on rather than chase the Agent for documents.
+// Installed, but the SEDA milestone hasn't been submitted yet. This is the step that follows the
+// physical install and it's easy to lose track of, so it gets its own chase list.
+function buildPendingMilestoneReportDoc(cases) {
+ const list = cases.filter(c =>
+ c.pkg.packageType === "Solar Package" &&
+ !skipsSedaTnb(c) &&
+ !(c.cancellation && c.cancellation.isCancelled) &&
+ installComplete(c) &&
+ !c.seda.milestoneDate
+ );
+ const today = todayISO();
+ const daysBetween = (a, b) => Math.floor((new Date(b) - new Date(a)) / 86400000);
+ const withDays = list.map(c => {
+ const d = lastInstallDate(c);
+ return { c, instDate: d, days: d ? daysBetween(d, today) : 0 };
+ });
+ withDays.sort((a, b) => (a.instDate || "").localeCompare(b.instDate || ""));
+
+ const rows = withDays.map(x => trHtml(
+ [
+ x.c.customerName || "-",
+ agentDisplay(x.c),
+ x.c.pkg.propertyType,
+ x.instDate ? fmtDate(x.instDate) : "-",
+ `${x.days} days`,
+ x.c.seda.approvalDate ? fmtDate(x.c.seda.approvalDate) : "-",
+ x.c.seda.certificationNo || "-",
+ ],
+ x.days >= 30 ? "background:#FBEAEA;color:#8B3A3A;" : x.days >= 14 ? "background:#FFF6E8;color:#8A6416;" : ""
+ )).join("");
+
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Pending Update Milestone &nbsp;—&nbsp; ${fmtDate(today)}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">*Cases already installed where the SEDA milestone still hasn't been updated. Sorted by install date, oldest first; 30+ days in red, 14+ days in orange. A case drops off this list once its Milestone Date is filled in on the SEDA tab.</div>
+ ${styledTable(["Customer", "Agent", "Property Type", "Install Date", "Waiting", "SEDA Approval", "Certification No."], rows || trHtml(["No cases pending","","","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;">Total: ${list.length}</div>`;
+ return { title: `Pending Update Milestone ${fmtDate(today)}`, html };
+}
+
+function buildPendingSedaApprovalReportDoc(cases) {
+ const list = cases.filter(c =>
+ c.pkg.packageType === "Solar Package" &&
+ !skipsSedaTnb(c) &&
+ !(c.cancellation && c.cancellation.isCancelled) &&
+ c.seda.submitDate &&
+ !c.seda.approvalDate
+ );
+ const today = todayISO();
+ const daysBetween = (a, b) => Math.floor((new Date(b) - new Date(a)) / 86400000);
+ const withDays = list.map(c => ({ c, submitDate: c.seda.submitDate, days: daysBetween(c.seda.submitDate, today) }));
+ withDays.sort((a, b) => (a.submitDate || "").localeCompare(b.submitDate || ""));
+ const rows = withDays.map(x => trHtml(
+ [x.c.customerName || "-", agentDisplay(x.c), x.c.pkg.propertyType, fmtDate(x.submitDate), `${x.days} days`, x.c.pkg.systemType, fmtMoney(x.c.pkg.sellingPrice)],
+ x.days >= 30 ? "background:#FBEAEA;color:#8B3A3A;" : x.days >= 14 ? "background:#FFF6E8;color:#8A6416;" : ""
+ )).join("");
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Pending SEDA Approval &nbsp;—&nbsp; ${fmtDate(today)}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">*Submitted to SEDA but not yet approved. Oldest submission first; 30+ days in red, 14+ days in orange.</div>
+ ${styledTable(["Customer", "Agent", "Property Type", "Submit Date", "Waiting", "System Type", "Price"], rows || trHtml(["No cases pending","","","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;">Total: ${list.length}</div>`;
+ return { title: `Pending SEDA Approval ${fmtDate(today)}`, html };
+}
+
+// TNB applied but the Welcome Letter hasn't arrived — the system can't be energised until it does,
+// and the balance payment usually waits on it too.
+function buildPendingWelcomeLetterReportDoc(cases) {
+ const list = cases.filter(c =>
+ c.pkg.packageType === "Solar Package" &&
+ !skipsSedaTnb(c) &&
+ !(c.cancellation && c.cancellation.isCancelled) &&
+ c.tnb.applyDate &&
+ !c.tnb.welcomeDate
+ );
+ const today = todayISO();
+ const daysBetween = (a, b) => Math.floor((new Date(b) - new Date(a)) / 86400000);
+ const withDays = list.map(c => ({ c, applyDate: c.tnb.applyDate, days: daysBetween(c.tnb.applyDate, today) }));
+ withDays.sort((a, b) => (a.applyDate || "").localeCompare(b.applyDate || ""));
+ const rows = withDays.map(x => trHtml(
+ [x.c.customerName || "-", agentDisplay(x.c), x.c.pkg.propertyType, fmtDate(x.applyDate), `${x.days} days`,
+ `${paymentPercent(x.c)}%`, fmtMoney((Number(x.c.pkg.sellingPrice) || 0) - paymentTotal(x.c))],
+ x.days >= 30 ? "background:#FBEAEA;color:#8B3A3A;" : x.days >= 14 ? "background:#FFF6E8;color:#8A6416;" : ""
+ )).join("");
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Pending Welcome Letter &nbsp;—&nbsp; ${fmtDate(today)}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">*TNB applied but the Welcome Letter hasn't been received yet. Oldest application first; 30+ days in red, 14+ days in orange. Balance still owing is shown so collection can follow once the letter lands.</div>
+ ${styledTable(["Customer", "Agent", "Property Type", "TNB Apply Date", "Waiting", "Payment %", "Balance"], rows || trHtml(["No cases pending","","","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;">Total: ${list.length}</div>`;
+ return { title: `Pending Welcome Letter ${fmtDate(today)}`, html };
+}
+
+function buildPendingTnbApplicationReportDoc(cases) {
+ const list = cases.filter(c =>
+ c.pkg.packageType === "Solar Package" &&
+ !skipsSedaTnb(c) &&
+ !(c.cancellation && c.cancellation.isCancelled) &&
+ installComplete(c) &&
+ !c.tnb.applyDate
+ );
+ const today = todayISO();
+ const daysBetween = (a, b) => Math.floor((new Date(b) - new Date(a)) / 86400000);
+ const withDays = list.map(c => ({ c, instDate: lastInstallDate(c), days: lastInstallDate(c) ? daysBetween(lastInstallDate(c), today) : 0 }));
+ withDays.sort((a, b) => (a.instDate || "").localeCompare(b.instDate || ""));
+ const rows = withDays.map(x => trHtml(
+ [x.c.customerName || "-", agentDisplay(x.c), x.instDate ? fmtDate(x.instDate) : "-", `${x.days} days`, x.c.pkg.region || "-"],
+ x.days >= 7 ? "background:#FBEAEA;color:#8B3A3A;" : x.days >= 3 ? "background:#FFF6E8;color:#8A6416;" : ""
+ )).join("");
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Pending TNB Application &nbsp;—&nbsp; ${fmtDate(today)}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">* TNB caseSolar Package —— 7 highlight3 <br/>Cases fully installed but TNB not yet applied, oldest first. 7+ days in red, 3+ days in orange.</div>
+ ${styledTable(["Customer", "Agent", "Install Date", "Waiting", "Region"], rows || trHtml(["TNB case No cases pending","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;"> Total${list.length}</div>`;
+ return { title: `Pending TNB Application ${fmtDate(today)}`, html };
+}
+
+function buildSedaReportDoc(startDate, endDate, cases) {
+ const list = cases.filter(c => inRange(c.seda.submitDate, startDate, endDate));
+ list.sort((a, b) => (a.seda.submitDate || "").localeCompare(b.seda.submitDate || ""));
+ const rows = list.map(c => {
+ const approved = !!c.seda.approvalDate;
+ const status = approved ? ` Approved ${fmtDate(c.seda.approvalDate)}` : "Pending Approval";
+ return trHtml(
+ [c.customerName || "-", agentDisplay(c), c.pkg.propertyType, fmtDate(c.seda.submitDate), c.pkg.systemType, status],
+ approved ? "background:#EAF5EE;color:#3C8C63;" : "background:#FFF6E8;color:#8A6416;"
+ );
+ }).join("");
+ const approvedCount = list.filter(c => c.seda.approvalDate).length;
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">SEDA Application Report &nbsp;—&nbsp; ${dateRangeLabel(startDate, endDate)}</h1>
+ ${styledTable(["Customer", "Agent", "Property", "Submit Date", "System", "Approval Status"], rows || trHtml(["case / No cases in this range","","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;"> Count${list.length} &nbsp;|&nbsp; Approved${approvedCount} &nbsp;|&nbsp; Pending${list.length - approvedCount}</div>
+ <div style="margin-top:8px;font-size:11px;color:#666;">*/ Sorted by submit date, earliest first.</div>`;
+ return { title: `SEDA Application Report ${startDate}~${endDate}`, html };
+}
+
+function buildTnbReportDoc(startDate, endDate, cases) {
+ const list = cases.filter(c => inRange(c.tnb.applyDate, startDate, endDate));
+ list.sort((a, b) => (a.tnb.applyDate || "").localeCompare(b.tnb.applyDate || ""));
+ const rows = list.map(c => {
+ const received = !!c.tnb.welcomeDate;
+ const status = received ? ` Received ${fmtDate(c.tnb.welcomeDate)}` : "Not Received";
+ return trHtml(
+ [c.customerName || "-", agentDisplay(c), c.pkg.propertyType, fmtDate(c.tnb.applyDate), status],
+ received ? "background:#EAF5EE;color:#3C8C63;" : "background:#FFF6E8;color:#8A6416;"
+ );
+ }).join("");
+ const receivedCount = list.filter(c => c.tnb.welcomeDate).length;
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">TNB Application Report &nbsp;—&nbsp; ${dateRangeLabel(startDate, endDate)}</h1>
+ ${styledTable(["Customer", "Agent", "Property", "Apply Date", "Welcome Letter Status"], rows || trHtml(["case / No cases in this range","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;"> Count${list.length} &nbsp;|&nbsp; Welcome Letter${receivedCount} &nbsp;|&nbsp; ${list.length - receivedCount}</div>
+ <div style="margin-top:8px;font-size:11px;color:#666;">*/ Sorted by apply date, earliest first.</div>`;
+ return { title: `TNB Application Report ${startDate}~${endDate}`, html };
+}
+
+function buildOMReportDoc(cases) {
+ const rows = [];
+ cases.forEach(c => {
+ (c.om.records || []).forEach(r => {
+ if (!r.resolvedDate) rows.push({ c, r });
+ });
+ });
+ const today = todayISO();
+ const daysBetween = (a, b) => Math.floor((new Date(b) - new Date(a)) / 86400000);
+ rows.sort((a, b) => (a.r.reportDate || "").localeCompare(b.r.reportDate || ""));
+ const tableRows = rows.map(({ c, r }) => {
+ const days = r.reportDate ? daysBetween(r.reportDate, today) : 0;
+ return trHtml(
+ [c.customerName || "-", agentDisplay(c), `${r.issueType} ${ISSUE_TYPE_EN[r.issueType] || ""}`, fmtDate(r.reportDate), r.scheduledDate ? fmtDate(r.scheduledDate) : "Pending", `${days} days`],
+ days >= 7 ? "background:#FBEAEA;color:#8B3A3A;" : days >= 3 ? "background:#FFF6E8;color:#8A6416;" : ""
+ );
+ }).join("");
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">O&M Report &nbsp;—&nbsp; ${fmtDate(today)}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">* —— 7 highlight3 <br/>*Shows every unresolved O&M record regardless of date, so nothing slips through. Oldest first; 7+ days in red, 3+ days in orange.</div>
+ ${styledTable(["Customer", "Agent", "Issue", "Reported", "Scheduled", "Waiting"], tableRows || trHtml(["No unresolved records","","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;"> Unresolved Records${rows.length}</div>`;
+ return { title: `O&M Report ${fmtDate(today)}`, html };
+}
+
+function paymentCrossDateForThreshold(c, thresholdPct) {
+ const price = Number(c.pkg.sellingPrice) || 0;
+ if (!price) return null;
+ const sorted = c.payment.records.slice().sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+ let cum = 0;
+ for (const r of sorted) {
+ cum += Number(r.amount) || 0;
+ if ((cum / price) * 100 >= thresholdPct) return r.date || null;
+ }
+ return null;
+}
+
+// Only the thresholds that actually have a report button — an 80% rung here would silently
+// swallow cases (e.g. 86% paid) into a report nobody can open.
+const THRESHOLD_LADDER = [60, 100];
+
+// 40%81%
+// 60%80%
+function highestThresholdCrossedInRange(c, startDate, endDate) {
+ let highest = null;
+ for (const t of THRESHOLD_LADDER) {
+ const d = paymentCrossDateForThreshold(c, t);
+ if (inRange(d, startDate, endDate)) highest = t;
+ }
+ return highest;
+}
+
+function buildPaymentThresholdReportDoc(thresholdPct, startDate, endDate, cases) {
+ const list = cases.filter(c => highestThresholdCrossedInRange(c, startDate, endDate) === thresholdPct);
+ const rows = list.map(c => {
+ const instDate = lastInstallDate(c);
+ return trHtml([
+ c.customerName || "-",
+ agentDisplay(c),
+ c.pkg.propertyType,
+ fmtDate(paymentCrossDateForThreshold(c, thresholdPct)),
+ `${paymentPercent(c)}%`,
+ fmtMoney(c.pkg.sellingPrice),
+ installComplete(c) ? (instDate ? fmtDate(instDate) : "-") : "Not Installed",
+ ]);
+ }).join("");
+ const label = thresholdPct >= 100 ? "Full Payment" : `${thresholdPct}%+ Paid`;
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">${label} &nbsp;—&nbsp; ${dateRangeLabel(startDate, endDate)}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">*If a single payment crosses multiple thresholds at once, the case is only counted under the highest threshold reached in this range.</div>
+ ${styledTable(["Customer", "Agent", "Property", "Date", "Payment %", "Price", "Install Date"], rows || trHtml(["No cases in this range","","","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;">Count: ${list.length}</div>`;
+ return { title: `${label} ${startDate}~${endDate}`, html };
+}
+
+// A purchasing matrix laid out like the spreadsheet the warehouse already works from: models
+// across the top grouped by category, one customer per row, quantities in the cells, and a
+// column total at the bottom to order against. A component leaves the grid the moment its
+// install date is filled in, so what's left is exactly what still has to be bought.
+function buildMaterialRequirementReportDoc(cases) {
+ const live = cases.filter(c => !(c.cancellation && c.cancellation.isCancelled) && !installComplete(c));
+
+ // Pass 1 — work out which models are still outstanding, so the grid only carries live columns.
+ const rowsData = [];
+ const colMeta = {}; // model -> category
+ live.forEach(c => {
+ const need = {};
+ const want = (category, model, qty) => {
+ if (!model || !qty) return;
+ need[model] = (need[model] || 0) + qty;
+ if (!colMeta[model]) colMeta[model] = category;
+ };
+ if (!c.install.panel.date && c.pkg.panelModel) want("Panel", c.pkg.panelSizeW ? `${c.pkg.panelSizeW}W` : c.pkg.panelModel, Number(c.pkg.panelCount) || 0);
+ if (!c.install.inverter.date) {
+ if (c.pkg.inverterModel) want("Inverter", c.pkg.inverterModel, 1);
+ (c.pkg.inverterEntries || []).forEach(e => want("Inverter", e.model, Number(e.qty) || 1));
+ }
+ if (!c.install.battery.date) {
+ want("Battery", (c.pkg.battery && c.pkg.battery.model) || c.install.battery.model,
+ Number((c.pkg.battery && c.pkg.battery.qty) || c.install.battery.qty) || 1);
+ }
+ if (!c.install.ev.date && suppliesGoods(c)) {
+ want("EV Charger", (c.pkg.evCharger && c.pkg.evCharger.model) || c.install.ev.model,
+ Number((c.pkg.evCharger && c.pkg.evCharger.qty) || c.install.ev.qty) || 1);
+ }
+ if (!c.install.capBank.date) want("Cap Bank", c.install.capBank.model, Number(c.install.capBank.qty) || 1);
+ // FOC lines are giveaways rather than something to purchase, so they stay off this report.
+ (c.pkg.otherEntries || []).forEach(e => {
+ if (/\bFOC\b/i.test(e.name || "")) return;
+ want("Other", e.name, Number(e.qty) || 1);
+ });
+
+ if (Object.keys(need).length) rowsData.push({ c, need });
+ });
+
+ // Columns grouped by category, matching how stock is organised in the Item Directory.
+ const catOrder = ["Panel", "Inverter", "Battery", "EV Charger", "Cap Bank", "Other"];
+ const columns = Object.keys(colMeta).sort((a, b) => {
+ const ca = catOrder.indexOf(colMeta[a]), cb = catOrder.indexOf(colMeta[b]);
+ if (ca !== cb) return ca - cb;
+ return a.localeCompare(b);
+ });
+
+ const catColor = { Panel: "#0B2A4A", Inverter: "#2E7D6B", Battery: "#6B4E9E", "EV Charger": "#C2410C", "Cap Bank": "#C89B3C", Other: "#8B3A3A" };
+
+ // Two header rows: category bands on top, model names beneath.
+ const bands = [];
+ columns.forEach(m => {
+ const cat = colMeta[m];
+ const last = bands[bands.length - 1];
+ if (last && last.cat === cat) last.span++;
+ else bands.push({ cat, span: 1 });
+ });
+ const bandRow = `<tr><th style="border:1px solid #ccc;background:#fff;"></th><th style="border:1px solid #ccc;background:#fff;"></th>` +
+ bands.map(b => `<th colspan="${b.span}" style="border:1px solid #ccc;padding:5px;font-size:11px;color:#fff;background:${catColor[b.cat] || "#6B7686"};">${b.cat}</th>`).join("") +
+ `</tr>`;
+ const modelRow = `<tr style="background:#F5F3ED;">` +
+ `<th style="border:1px solid #ccc;padding:6px 8px;font-size:11.5px;text-align:left;">Customer</th>` +
+ `<th style="border:1px solid #ccc;padding:6px 8px;font-size:11.5px;text-align:left;">Agent</th>` +
+ columns.map(m => `<th style="border:1px solid #ccc;padding:6px 4px;font-size:10.5px;">${m}</th>`).join("") +
+ `</tr>`;
+
+ const body = rowsData.map(({ c, need }) =>
+ `<tr>` +
+ `<td style="border:1px solid #ccc;padding:5px 8px;font-size:11.5px;font-weight:bold;">${c.customerName || "-"}</td>` +
+ `<td style="border:1px solid #ccc;padding:5px 8px;font-size:11px;color:#666;">${agentDisplay(c)}</td>` +
+ columns.map(m => `<td style="border:1px solid #ccc;padding:5px 4px;font-size:11.5px;text-align:center;${need[m] ? "font-weight:bold;" : "color:#ddd;"}">${need[m] || "-"}</td>`).join("") +
+ `</tr>`
+ ).join("");
+
+ const totals = columns.map(m => rowsData.reduce((s, r) => s + (r.need[m] || 0), 0));
+ const totalRow = `<tr style="background:#FFF6DA;">` +
+ `<td colspan="2" style="border:1px solid #ccc;padding:6px 8px;font-size:12px;font-weight:bold;">TOTAL TO ORDER</td>` +
+ totals.map(t => `<td style="border:1px solid #ccc;padding:6px 4px;font-size:12.5px;text-align:center;font-weight:bold;color:#8A6414;">${t}</td>`).join("") +
+ `</tr>`;
+
+ const today = fmtDate(todayISO());
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Material Requirement (Purchasing) &nbsp;—&nbsp; ${today}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">*Outstanding goods for every case not yet installed. A quantity disappears from the grid once that component's install date is filled in.</div>
+ ${columns.length === 0
+ ? `<div style="padding:14px 0;color:#999;">Nothing outstanding.</div>`
+ : `<table style="width:100%;border-collapse:collapse;margin-top:10px;"><thead>${bandRow}${modelRow}</thead><tbody>${body}${totalRow}</tbody></table>`}
+ <div style="margin-top:12px;font-size:13px;">Pending cases: ${rowsData.length}</div>`;
+ return { title: `Material Requirement ${today}`, html };
+}
+
+// The completed counterpart to the purchasing matrix: same grid, but showing goods that have
+// already gone out (install date filled in) rather than what still needs buying. Selling price
+// is included here because these are finished jobs worth reconciling against revenue.
+function buildInstalledMaterialReportDoc(startDate, endDate, cases) {
+ const live = cases.filter(c =>
+ !(c.cancellation && c.cancellation.isCancelled) &&
+ installApplicableItems(c).some(k => c.install[k].date) &&
+ inRange(lastInstallDate(c), startDate, endDate)
+ );
+ live.sort((a, b) => (lastInstallDate(a) || "").localeCompare(lastInstallDate(b) || ""));
+
+ const rowsData = [];
+ const colMeta = {};
+ live.forEach(c => {
+ const done = {};
+ const had = (category, model, qty) => {
+ if (!model || !qty) return;
+ done[model] = (done[model] || 0) + qty;
+ if (!colMeta[model]) colMeta[model] = category;
+ };
+ // Mirror of the purchasing report — here we count components that DO have an install date.
+ if (c.install.panel.date && c.pkg.panelModel) had("Panel", c.pkg.panelSizeW ? `${c.pkg.panelSizeW}W` : c.pkg.panelModel, Number(c.pkg.panelCount) || 0);
+ if (c.install.inverter.date) {
+ if (c.pkg.inverterModel) had("Inverter", c.pkg.inverterModel, 1);
+ (c.pkg.inverterEntries || []).forEach(e => had("Inverter", e.model, Number(e.qty) || 1));
+ }
+ if (c.install.battery.date) {
+ had("Battery", (c.pkg.battery && c.pkg.battery.model) || c.install.battery.model,
+ Number((c.pkg.battery && c.pkg.battery.qty) || c.install.battery.qty) || 1);
+ }
+ if (c.install.ev.date && suppliesGoods(c)) {
+ had("EV Charger", (c.pkg.evCharger && c.pkg.evCharger.model) || c.install.ev.model,
+ Number((c.pkg.evCharger && c.pkg.evCharger.qty) || c.install.ev.qty) || 1);
+ }
+ if (c.install.capBank.date) had("Cap Bank", c.install.capBank.model, Number(c.install.capBank.qty) || 1);
+ (c.pkg.otherEntries || []).forEach(e => {
+ if (/\bFOC\b/i.test(e.name || "")) return;
+ had("Other", e.name, Number(e.qty) || 1);
+ });
+
+ if (Object.keys(done).length) rowsData.push({ c, done });
+ });
+
+ const catOrder = ["Panel", "Inverter", "Battery", "EV Charger", "Cap Bank", "Other"];
+ const columns = Object.keys(colMeta).sort((a, b) => {
+ const ca = catOrder.indexOf(colMeta[a]), cb = catOrder.indexOf(colMeta[b]);
+ if (ca !== cb) return ca - cb;
+ return a.localeCompare(b);
+ });
+ const catColor = { Panel: "#0B2A4A", Inverter: "#2E7D6B", Battery: "#6B4E9E", "EV Charger": "#C2410C", "Cap Bank": "#C89B3C", Other: "#8B3A3A" };
+
+ const bands = [];
+ columns.forEach(m => {
+ const cat = colMeta[m];
+ const last = bands[bands.length - 1];
+ if (last && last.cat === cat) last.span++;
+ else bands.push({ cat, span: 1 });
+ });
+ const bandRow = `<tr><th style="border:1px solid #ccc;background:#fff;"></th><th style="border:1px solid #ccc;background:#fff;"></th><th style="border:1px solid #ccc;background:#fff;"></th>` +
+ bands.map(b => `<th colspan="${b.span}" style="border:1px solid #ccc;padding:5px;font-size:11px;color:#fff;background:${catColor[b.cat] || "#6B7686"};">${b.cat}</th>`).join("") +
+ `<th style="border:1px solid #ccc;background:#fff;"></th></tr>`;
+ const modelRow = `<tr style="background:#F5F3ED;">` +
+ `<th style="border:1px solid #ccc;padding:6px 8px;font-size:11.5px;text-align:left;">Customer</th>` +
+ `<th style="border:1px solid #ccc;padding:6px 8px;font-size:11.5px;text-align:left;">Agent</th>` +
+ `<th style="border:1px solid #ccc;padding:6px 6px;font-size:11px;">Install Date</th>` +
+ columns.map(m => `<th style="border:1px solid #ccc;padding:6px 4px;font-size:10.5px;">${m}</th>`).join("") +
+ `<th style="border:1px solid #ccc;padding:6px 8px;font-size:11.5px;">Selling Price</th></tr>`;
+
+ const body = rowsData.map(({ c, done }) =>
+ `<tr>` +
+ `<td style="border:1px solid #ccc;padding:5px 8px;font-size:11.5px;font-weight:bold;">${c.customerName || "-"}</td>` +
+ `<td style="border:1px solid #ccc;padding:5px 8px;font-size:11px;color:#666;">${agentDisplay(c)}</td>` +
+ `<td style="border:1px solid #ccc;padding:5px 6px;font-size:11px;text-align:center;">${lastInstallDate(c) ? fmtDate(lastInstallDate(c)) : "-"}</td>` +
+ columns.map(m => `<td style="border:1px solid #ccc;padding:5px 4px;font-size:11.5px;text-align:center;${done[m] ? "font-weight:bold;" : "color:#ddd;"}">${done[m] || "-"}</td>`).join("") +
+ `<td style="border:1px solid #ccc;padding:5px 8px;font-size:11.5px;text-align:right;font-weight:bold;">${fmtMoney(c.pkg.sellingPrice)}</td>` +
+ `</tr>`
+ ).join("");
+
+ const totals = columns.map(m => rowsData.reduce((s, r) => s + (r.done[m] || 0), 0));
+ const grandTotal = rowsData.reduce((s, r) => s + (Number(r.c.pkg.sellingPrice) || 0), 0);
+ const totalRow = `<tr style="background:#FFF6DA;">` +
+ `<td colspan="3" style="border:1px solid #ccc;padding:6px 8px;font-size:12px;font-weight:bold;">TOTAL INSTALLED</td>` +
+ totals.map(t => `<td style="border:1px solid #ccc;padding:6px 4px;font-size:12.5px;text-align:center;font-weight:bold;color:#8A6414;">${t}</td>`).join("") +
+ `<td style="border:1px solid #ccc;padding:6px 8px;font-size:12.5px;text-align:right;font-weight:bold;color:#8A6414;">${fmtMoney(grandTotal)}</td></tr>`;
+
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Installed Material Report &nbsp;—&nbsp; ${dateRangeLabel(startDate, endDate)}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">*Goods already delivered and installed, by case. Grouped by the last install date in the range. FOC give-away items are excluded.</div>
+ ${columns.length === 0
+ ? `<div style="padding:14px 0;color:#999;">No installations in this range.</div>`
+ : `<table style="width:100%;border-collapse:collapse;margin-top:10px;"><thead>${bandRow}${modelRow}</thead><tbody>${body}${totalRow}</tbody></table>`}
+ <div style="margin-top:12px;font-size:13px;">Cases: ${rowsData.length} &nbsp;|&nbsp; Total value: ${fmtMoney(grandTotal)}</div>`;
+ return { title: `Installed Material ${startDate}~${endDate}`, html };
+}
+
+function buildInstallQueueReportDoc(cases) {
+ // Solar work waits for 60% because SEDA/TNB approvals sit in between. EV Charger and Other
+ // jobs have no approval stage, so a deposit is enough to schedule the crew.
+ const qualifies = c => c.payment.installOverride
+ || (skipsSedaTnb(c)
+ ? paymentTotal(c) > 0
+ : (paymentPercent(c) >= 60 || (c.payment.isLoanCase && !!c.payment.loReceivedDate)));
+ const cancelled = c => c.cancellation && c.cancellation.isCancelled;
+
+ // "In progress" = has at least one dated component but still has ticked items with no date.
+ // These are already started — they must be finished before new installs, so they go FIRST.
+ const inProgress = cases.filter(c =>
+ !cancelled(c) && needsInstallCrew(c) &&
+ installApplicableItems(c).some(k => !!c.install[k].date) &&
+ installPendingItems(c).length > 0
+ );
+
+ // Normal queue = qualified (60%+ or LO) but not yet started at all.
+ const notStarted = cases.filter(c =>
+ !cancelled(c) && needsInstallCrew(c) &&
+ !installApplicableItems(c).some(k => !!c.install[k].date) &&
+ qualifies(c)
+ );
+ const withDate = notStarted.map(c => {
+ // Label the reason each case became schedulable, since the bar differs by package type.
+ const noApproval = skipsSedaTnb(c);
+ const via60 = paymentPercent(c) >= 60;
+ const override = c.payment.installOverride && !via60;
+ const crossDate = override
+ ? (c.payment.overrideDate || firstPaymentDate(c) || "")
+ : (noApproval && !via60
+ ? (firstPaymentDate(c) || "")
+ : (via60 ? (paymentCrossDateForThreshold(c, 60) || firstPaymentDate(c) || "") : (c.payment.loReceivedDate || "")));
+ const reason = via60
+ ? "60%+ Paid"
+ : override
+ ? `⚡ SPECIAL APPROVAL${c.payment.overrideApprovedBy ? ` — ${c.payment.overrideApprovedBy}` : ""}`
+ : (noApproval ? "Deposit Paid" : "Loan LO Received");
+ return { c, crossDate, reason };
+ });
+ withDate.sort((a, b) => (a.crossDate || "").localeCompare(b.crossDate || ""));
+
+ const buildSection = (title, items, rowFn, color) => {
+ if (!items.length) return "";
+ const groups = {};
+ items.forEach(x => {
+ const region = x.c.pkg.region || "Region Not Set";
+ if (!groups[region]) groups[region] = [];
+ groups[region].push(x);
+ });
+ const regionOrder = Object.keys(groups).sort((a, b) => {
+ if (a === "Region Not Set") return 1;
+ if (b === "Region Not Set") return -1;
+ return a.localeCompare(b);
+ });
+ return `<div style="font-weight:bold;font-size:14px;margin-top:18px;color:${color};border-left:4px solid ${color};padding-left:8px;">${title}${items.length} case</div>` +
+ regionOrder.map(region => {
+ const rows = groups[region].map((x, i) => rowFn(x, i)).join("");
+ return `<div style="font-weight:bold;font-size:12px;margin-top:10px;color:#6B7686;">${region}</div>
+ ${styledTable(["# Queue", "Customer", "Agent", "Property", "Qualified Date", "Payment %", "Price", "Status"], rows)}`;
+ }).join("");
+ };
+
+ const inProgressItems = inProgress.map(c => {
+ const via60 = paymentPercent(c) >= 60;
+ const crossDate = via60 ? (paymentCrossDateForThreshold(c, 60) || firstPaymentDate(c) || "") : (c.payment.loReceivedDate || "");
+ return { c, crossDate, reason: "" };
+ });
+
+ const getOtherItems = (c) => {
+ const others = (c.pkg.otherEntries || []).filter(e => e.name).map(e => `${e.name}${e.qty > 1 ? ` x${e.qty}` : ""}`);
+ return others.length ? others.join(", ") : "-";
+ };
+ // Panel count and inverter model(s) drive what the install crew actually needs to load, so
+ // surface them right in the queue instead of making someone open each case to check.
+ const getPanelSpec = (c) => c.pkg.panelCount ? `${c.pkg.panelCount}x ${c.pkg.panelSizeW || "-"}W` : "-";
+ const getInverterSpec = (c) => {
+ const all = [];
+ if (c.pkg.inverterModel) all.push(c.pkg.inverterModel);
+ (c.pkg.inverterEntries || []).forEach(e => { if (e.model) all.push(`${e.model}${e.qty > 1 ? ` x${e.qty}` : ""}`); });
+ return all.length ? all.join(", ") : "-";
+ };
+ // Battery / EV Charger / Cap Bank are what an EV or Top Up job actually installs — without
+ // these the crew would only see a name and address and not know what to bring.
+ const getEquipmentSpec = (c) => {
+ const all = [];
+ if (isEV(c)) {
+ // Installation Only means the customer already has the unit — the crew needs the phase,
+ // not a model number, so flag it clearly instead of listing equipment we aren't bringing.
+ if (c.pkg.evJobType === "Installation Only") {
+ return `INSTALLATION ONLY (${c.pkg.phaseType || "phase not set"}) — customer supplies unit`;
+ }
+ all.push(`[${c.pkg.evJobType}]`);
+ }
+ const bModel = (c.pkg.battery && c.pkg.battery.model) || c.install.battery.model;
+ const bQty = Number((c.pkg.battery && c.pkg.battery.qty) || c.install.battery.qty) || 1;
+ if (bModel) all.push(`Battery: ${bModel}${bQty > 1 ? ` x${bQty}` : ""}`);
+ const eModel = (c.pkg.evCharger && c.pkg.evCharger.model) || c.install.ev.model;
+ const eQty = Number((c.pkg.evCharger && c.pkg.evCharger.qty) || c.install.ev.qty) || 1;
+ if (eModel) all.push(`EV: ${eModel}${eQty > 1 ? ` x${eQty}` : ""}`);
+ if (c.install.capBank.model) all.push(`Cap Bank: ${c.install.capBank.model}${(Number(c.install.capBank.qty) || 1) > 1 ? ` x${c.install.capBank.qty}` : ""}`);
+ return all.length ? all.join(", ") : "-";
+ };
+ // Group by the finer District when Admin has filled it in — a whole state is too broad to
+ // schedule a crew around, so JB/PONTIAN/KULAI etc. get their own sub-heading.
+ const groupKey = (c) => {
+ const state = c.pkg.region || "Region Not Set";
+ const district = (c.pkg.district || "").trim();
+ return district ? `${state} - ${district}` : state;
+ };
+
+ const inProgressSection = inProgressItems.length
+ ? `<div style="font-weight:bold;font-size:14px;margin-top:18px;color:#C24141;border-left:4px solid #C24141;padding-left:8px;">🔴 In Progress — Complete First${inProgressItems.length} case</div>` +
+ (() => {
+ const groups = {};
+ inProgressItems.forEach(x => {
+ const region = groupKey(x.c);
+ if (!groups[region]) groups[region] = [];
+ groups[region].push(x);
+ });
+ return Object.keys(groups).sort().map(region => {
+ const rows = groups[region].map((x, i) => trHtml([
+ i + 1, x.c.customerName || "-", agentDisplay(x.c), x.c.pkg.propertyType,
+ `${x.c.pkg.region || "-"}${x.c.pkg.district ? ` - ${x.c.pkg.district}` : ""}`,
+ getPanelSpec(x.c), getInverterSpec(x.c), getEquipmentSpec(x.c),
+ x.crossDate ? fmtDate(x.crossDate) : "-", `${paymentPercent(x.c)}%`, fmtMoney(x.c.pkg.sellingPrice),
+ `⚠️ Pending: ${installPendingItems(x.c).join(", ")}`,
+ getOtherItems(x.c),
+ ], "background:#FBEAEA;")).join("");
+ return `<div style="font-weight:bold;font-size:12px;margin-top:10px;color:#6B7686;">${region}</div>
+ ${styledTable(["# Queue", "Customer", "Agent", "Property Type", "Region / Area", "Panel", "Inverter", "Equipment", "Qualified Date", "Payment %", "Price", "Pending", "Other"], rows)}`;
+ }).join("");
+ })()
+ : "";
+
+ const groups = {};
+ withDate.forEach(x => {
+ const region = groupKey(x.c);
+ if (!groups[region]) groups[region] = [];
+ groups[region].push(x);
+ });
+ const regionOrder = Object.keys(groups).sort((a, b) => {
+ if (a === "Region Not Set") return 1;
+ if (b === "Region Not Set") return -1;
+ return a.localeCompare(b);
+ });
+ const queueSection = withDate.length
+ ? `<div style="font-weight:bold;font-size:14px;margin-top:24px;color:#2E7D6B;border-left:4px solid #2E7D6B;padding-left:8px;">🟢 Awaiting Install${withDate.length} case</div>` +
+ regionOrder.map(region => {
+ const rows = groups[region].map((x, i) => trHtml([
+ i + 1, x.c.customerName || "-", agentDisplay(x.c), x.c.pkg.propertyType,
+ `${x.c.pkg.region || "-"}${x.c.pkg.district ? ` - ${x.c.pkg.district}` : ""}`,
+ getPanelSpec(x.c), getInverterSpec(x.c), getEquipmentSpec(x.c),
+ x.crossDate ? fmtDate(x.crossDate) : "-", `${paymentPercent(x.c)}%`, fmtMoney(x.c.pkg.sellingPrice),
+ x.reason, getOtherItems(x.c),
+ ])).join("");
+ return `<div style="font-weight:bold;font-size:12px;margin-top:10px;color:#6B7686;">${region}</div>
+ ${styledTable(["# Queue", "Customer", "Agent", "Property Type", "Region / Area", "Panel", "Inverter", "Equipment", "Qualified Date", "Payment %", "Price", "Reason", "Other"], rows)}`;
+ }).join("")
+ : "";
+
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;"> Install Queue &nbsp;—&nbsp; ${fmtDate(new Date().toISOString().slice(0,10))}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">*🔴 🟢 60%+LO<br/>*🔴 In Progress: started but some components still pending — handled first. 🟢 Awaiting Install: qualified but not yet started. Grouped by region.</div>
+ ${inProgressSection || ""}
+ ${queueSection || ""}
+ ${!inProgressItems.length && !withDate.length ? `<div style="padding:12px 0;color:#999;"> case No cases in queue</div>` :""}
+ <div style="margin-top:14px;font-size:13px;"> In Progress${inProgress.length} &nbsp;|&nbsp; Awaiting Install${notStarted.length} </div>`;
+ return { title: `Install Queue ${fmtDate(new Date().toISOString().slice(0,10))}`, html };
+}
+
+function buildPropertyTypeSummaryDoc(startDate, endDate, cases) {
+ const deals = cases.filter(c => inRange(firstPaymentDate(c), startDate, endDate));
+ const installs = cases.filter(c => installComplete(c) && inRange(lastInstallDate(c), startDate, endDate));
+ const rowsFor = (list) => PROPERTY_TYPES.map(p => trHtml([`${p.en}`, list.filter(c => c.pkg.propertyType === p.v).length])).join("");
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;"> Property Type Summary &nbsp;—&nbsp; ${dateRangeLabel(startDate, endDate)}</h1>
+ <div style="font-weight:bold;font-size:13px;margin-top:10px;"> New Deposits</div>
+ ${styledTable(["Property Type", "Count"], rowsFor(deals))}
+ <div style="margin-top:6px;font-size:12.5px;"> Subtotal${deals.length}</div>
+ <div style="font-weight:bold;font-size:13px;margin-top:18px;"> Installations Completed</div>
+ ${styledTable(["Property Type", "Count"], rowsFor(installs))}
+ <div style="margin-top:14px;font-size:14px;font-weight:bold;"> Total Installed${installs.length}</div>`;
+ return { title: `Property Type Summary ${startDate}~${endDate}`, html };
+}
+
+function buildDocLogReportDoc(startDate, endDate, cases, docLogs) {
+ const caseIds = new Set(cases.map(c => c.id));
+ const list = (docLogs || []).filter(l => {
+ if (!caseIds.has(l.caseId)) return false; // respects whatever Agent filter is active above
+ const d = l.timestamp.slice(0, 10);
+ return inRange(d, startDate, endDate);
+ });
+ list.sort((a, b) => b.timestamp.localeCompare(a.timestamp)); // newest first
+ const rows = list.map(l => {
+ const dt = new Date(l.timestamp);
+ const dateStr = fmtDate(`${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,"0")}-${String(dt.getDate()).padStart(2,"0")}`);
+ const timeStr = dt.toLocaleTimeString("en-MY", { hour: "2-digit", minute: "2-digit" });
+ const suffix = l.id ? l.id.slice(-4).toUpperCase() : "????";
+ const docLabel = l.docType === "Proforma Invoice" ? `Proforma Invoice #SO-${String(l.seq).padStart(6,"0")}-${suffix}` : `Quotation #CASE-${l.caseId ? l.caseId.slice(0,6).toUpperCase() : "-"}`;
+ const amountCell = l.docType === "Proforma Invoice" ? `${fmtMoney(l.amount)}${l.note ? ` (${l.note})` : ""}` : "-";
+ return trHtml([`${dateStr} ${timeStr}`, l.actor || "-", l.customerName || "-", docLabel, amountCell]);
+ }).join("");
+ const invoiceTotal = list.filter(l => l.docType === "Proforma Invoice").reduce((s, l) => s + (Number(l.amount) || 0), 0);
+ const invoiceCount = list.filter(l => l.docType === "Proforma Invoice").length;
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;"> Document Log &nbsp;—&nbsp; ${dateRangeLabel(startDate, endDate)}</h1>
+ <div style="font-size:11px;color:#666;margin-bottom:8px;">* Quotation / Proforma Invoice — Agent <br/>*Logs every Quotation/Proforma Invoice generation: who, when, which customer, and the amount — for auditing what an Agent actually told a customer to pay.</div>
+ ${styledTable(["Date/Time", "Generated By", "Customer", "Document", "Amount/Note"], rows || trHtml(["No documents generated in this range","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;"> ${list.length} &nbsp;|&nbsp; Proforma Invoice ${invoiceCount} ${fmtMoney(invoiceTotal)}</div>`;
+ return { title: `Document Log ${startDate}~${endDate}`, html };
+}
+
+function buildCancellationReportDoc(startDate, endDate, cases) {
+ const list = cases.filter(c => c.cancellation && c.cancellation.isCancelled && inRange(c.cancellation.cancelDate, startDate, endDate));
+ const rows = list.map(c => trHtml([c.customerName || "-", agentDisplay(c), fmtMoney(c.pkg.sellingPrice), fmtMoney(c.cancellation.refundAmount), c.cancellation.refundReason || "-", c.cancellation.companyRefundDate ? fmtDateFull(c.cancellation.companyRefundDate) : "Not Refunded"])).join("");
+ const totalRefund = list.reduce((s, c) => s + (Number(c.cancellation.refundAmount) || 0), 0);
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;"> Cancellation Report &nbsp;—&nbsp; ${dateRangeLabel(startDate, endDate)}</h1>
+ ${styledTable(["Customer", "Agent", "Price", "Refund", "Reason", "Refund Date"], rows || trHtml(["case / No cancellations in this range","","","","",""]))}
+ <div style="margin-top:14px;font-size:13px;"> Count${list.length} &nbsp;|&nbsp; Total Refund${fmtMoney(totalRefund)}</div>`;
+ return { title: `Cancellation Report ${startDate}~${endDate}`, html };
+}
+
+function PrintOverlay({ doc, onClose }) {
+ if (!doc) return null;
+ return (
+ <div style={{ position: "fixed", inset: 0, background: "rgba(11,42,74,0.55)", zIndex: 1000,
+ display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+ <div style={{ background: "#fff", borderRadius: 14, width: "100%", maxWidth: 720, maxHeight: "88vh",
+ display: "flex", flexDirection: "column", overflow: "hidden", boxShadow: "0 20px 60px rgba(0,0,0,0.3)" }}>
+ <div className="no-print" style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+ padding: "12px 18px", borderBottom: "1px solid #E9E4D8", background: "#FBFAF6" }}>
+ <span style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 14, color: "#1B2430" }}>{doc.title}</span>
+ <div style={{ display: "flex", gap: 8 }}>
+ <button onClick={() => window.print()} style={btnPrimary}><Printer size={14} /> / PDF</button>
+ <button onClick={() => downloadReportHtml(doc)} style={btnGhost}><FileDown size={14} /> Download</button>
+ <button onClick={onClose} style={btnGhost}><X size={14} /> </button>
+ </div>
+ </div>
+ <div className="no-print" style={{ padding: "6px 18px", fontSize: 11, color: "#9AA2AD", background: "#FBFAF6", borderBottom: "1px solid #F0ECE1" }}>
+ / PDF Download—— Chrome/Edge PDF 
+ </div>
+ <div className="eternalgy-print-area" style={{ padding: 24, overflowY: "auto", fontFamily: "Arial, Helvetica, sans-serif", color: "#1B2430" }}
+ dangerouslySetInnerHTML={{ __html: doc.html }} />
+ </div>
+ </div>
+ );
+}
+
+/* ---------- storage ---------- */
+
+function normalizeCase(c) {
+ const base = emptyCase();
+ return {
+ ...base, ...c,
+ pkg: { ...base.pkg, ...(c.pkg || {}),
+ battery: { ...base.pkg.battery, ...(c.pkg && c.pkg.battery) },
+ evCharger: { ...base.pkg.evCharger, ...(c.pkg && c.pkg.evCharger) },
+ otherEntries: (c.pkg && Array.isArray(c.pkg.otherEntries)) ? c.pkg.otherEntries
+ : (c.pkg && c.pkg.other && c.pkg.other.note) ? [{ id: uid(), name: c.pkg.other.note, price: c.pkg.other.price, qty: 1 }]
+ : base.pkg.otherEntries,
+ inverterEntries: (c.pkg && Array.isArray(c.pkg.inverterEntries)) ? c.pkg.inverterEntries : base.pkg.inverterEntries,
+ serviceEntries: (c.pkg && Array.isArray(c.pkg.serviceEntries)) ? c.pkg.serviceEntries : base.pkg.serviceEntries,
+ basePrice: (c.pkg && (c.pkg.basePrice || c.pkg.listPrice)) || base.pkg.basePrice,
+ eppEntries: (c.pkg && Array.isArray(c.pkg.eppEntries)) ? c.pkg.eppEntries : base.pkg.eppEntries,
+ atsEntries: (c.pkg && Array.isArray(c.pkg.atsEntries)) ? c.pkg.atsEntries
+ : (c.pkg && c.pkg.ats && c.pkg.ats.model) ? [{ id: uid(), name: c.pkg.ats.model, price: c.pkg.ats.price, qty: c.pkg.ats.qty || 1 }]
+ : base.pkg.atsEntries,
+ ballastEntries: (c.pkg && Array.isArray(c.pkg.ballastEntries)) ? c.pkg.ballastEntries
+ : (c.pkg && c.pkg.ballast && c.pkg.ballast.model) ? [{ id: uid(), name: c.pkg.ballast.model, price: c.pkg.ballast.price, qty: c.pkg.ballast.qty || 1 }]
+ : base.pkg.ballastEntries,
+ discountEntries: (c.pkg && Array.isArray(c.pkg.discountEntries)) ? c.pkg.discountEntries
+ : (c.pkg && Number(c.pkg.discountAmount) > 0) ? [{ id: uid(), description: "Discount", amount: c.pkg.discountAmount }]
+ : base.pkg.discountEntries,
+ },
+ payment: { ...base.payment, ...(c.payment || {}) },
+ seda: { ...base.seda, ...(c.seda || {}) },
+ install: { ...base.install, ...(c.install || {}),
+ panel: { ...base.install.panel, ...(c.install && c.install.panel) },
+ inverter: { ...base.install.inverter, ...(c.install && c.install.inverter) },
+ wiring: { ...base.install.wiring, ...(c.install && c.install.wiring) },
+ battery: { ...base.install.battery, ...(c.install && c.install.battery) },
+ ev: { ...base.install.ev, ...(c.install && c.install.ev) },
+ capBank: { ...base.install.capBank, ...(c.install && c.install.capBank) },
+ mounting: { ...base.install.mounting, ...(c.install && c.install.mounting) },
+ electrical: { ...base.install.electrical, ...(c.install && c.install.electrical) },
+ otherItems: (c.install && Array.isArray(c.install.otherItems)) ? c.install.otherItems : base.install.otherItems,
+ },
+ tnb: { ...base.tnb, ...(c.tnb || {}) },
+ om: { ...base.om, ...(c.om || {}) },
+ insurance: { ...base.insurance, ...(c.insurance || {}),
+ periods: (c.insurance && Array.isArray(c.insurance.periods)) ? c.insurance.periods : base.insurance.periods,
+ claimRecords: (c.insurance && Array.isArray(c.insurance.claimRecords)) ? c.insurance.claimRecords : base.insurance.claimRecords,
+ },
+ cancellation: { ...base.cancellation, ...(c.cancellation || {}) },
+ referral: { ...base.referral, ...(c.referral || {}) },
+ delivery: { ...base.delivery, ...(c.delivery || {}),
+ items: (c.delivery && Array.isArray(c.delivery.items) && c.delivery.items.length) ? c.delivery.items : base.delivery.items,
+ },
+ editHistory: Array.isArray(c.editHistory) ? c.editHistory : base.editHistory,
+ };
+}
+
+// Two storage modes for cases, switched by an admin-triggered one-time migration:
+// "legacy" = the whole list saved/loaded as one JSON blob under a single Firestore document —
+// any save from a stale in-memory copy silently overwrites cases someone else just added, which
+// is exactly the data-loss bug this migration exists to fix.
+// "percase" = each case is its own Firestore document, so saving one case can never touch or
+// overwrite any other case, no matter how many people are editing different cases at once.
+const CASES_COLLECTION = "case_records";
+async function loadCasesLegacy() {
+ try {
+ const res = await storage.get("cases", true);
+ const raw = res ? JSON.parse(res.value) : [];
+ return raw.map(normalizeCase);
+ } catch { return []; }
+}
+async function saveCasesLegacy(cases) {
+ try { await storage.set("cases", JSON.stringify(cases), true); } catch (e) { console.error(e); }
+}
+async function loadCasesPerDoc() {
+ const raw = await storage.listCollection(CASES_COLLECTION);
+ return raw.map(normalizeCase);
+}
+async function saveCasePerDoc(c) {
+ return storage.setDocById(CASES_COLLECTION, c.id, c);
+}
+async function deleteCasePerDoc(id) {
+ return storage.deleteDocById(CASES_COLLECTION, id);
+}
+async function loadCasesStorageMode() {
+ try {
+ const res = await storage.get("casesStorageMode", true);
+ return res && res.value === "percase" ? "percase" : "legacy";
+ } catch { return "legacy"; }
+}
+
+function emptyAgent() {
+ return { id: uid(), name: "", code: "", phone: "", email: "", referrer: "", note: "" };
+}
+function normalizeAgent(a) { return { ...emptyAgent(), ...a }; }
+async function loadAgentDirectory() {
+ try {
+ const res = await storage.get("agentDirectory", true);
+ const raw = res ? JSON.parse(res.value) : [];
+ return raw.map(normalizeAgent);
+ } catch { return []; }
+}
+async function saveAgentDirectory(list) {
+ try { await storage.set("agentDirectory", JSON.stringify(list), true); } catch (e) { console.error(e); }
+}
+// "Name (Code)" display used wherever an agent appears in the package section or on printed PDFs —
+// only the name + code are ever shown outward-facing; phone/email/referrer stay internal records only.
+function agentDisplay(c) {
+ if (!c.agentName) return "-";
+ return c.agentCode ? `${c.agentName} (${c.agentCode})` : c.agentName;
+}
+
+// NOTE ON SECURITY: this is a lightweight accountability gate, not real security. There is no
+// server — everything (including these passwords) lives in the same shared, client-readable storage
+// as the rest of the app's data. It stops accidental/unauthorized edits by casual users and gives an
+// edit-history trail, but a technically determined person could bypass it or read the stored
+// passwords. Do not rely on this to protect genuinely sensitive data.
+function emptyAdminAccount() {
+ return { id: uid(), name: "", email: "", password: "", phone: "", note: "" };
+}
+function normalizeAdminAccount(a) { return { ...emptyAdminAccount(), ...a }; }
+async function loadAdminDirectory() {
+ try {
+ const res = await storage.get("adminDirectory", true);
+ const raw = res ? JSON.parse(res.value) : [];
+ return raw.map(normalizeAdminAccount);
+ } catch { return []; }
+}
+async function saveAdminDirectory(list) {
+ try { await storage.set("adminDirectory", JSON.stringify(list), true); } catch (e) { console.error(e); }
+}
+
+const MALAYSIA_STATES = ["Johor", "Kedah", "Kelantan", "Melaka", "Negeri Sembilan", "Pahang", "Perak", "Perlis", "Pulau Pinang", "Sabah", "Sarawak", "Selangor", "Terengganu", "Kuala Lumpur", "Labuan", "Putrajaya"];
+const ITEM_CATEGORIES = ["Panel", "Inverter", "Battery", "EV Charger", "Cap Bank", "Other Goods"];
+const ITEM_CATEGORY_COLORS = {
+ "Panel": "#0B2A4A", "Inverter": "#2E7D6B", "Battery": "#6B4E9E",
+ "EV Charger": "#C2410C", "Cap Bank": "#C89B3C", "Other Goods": "#8B3A3A",
+};
+// Sorts items by the capacity in their name (5KW < 12KW < 110KW, 550W < 650W) rather than
+// alphabetically, which would put "110KW" before "5KW". Falls back to name order when a model
+// has no number in it. Panel watts are normalised so they don't outrank inverter kilowatts.
+function itemCapacity(it) {
+ const name = (it.name || "").toUpperCase();
+ const kw = name.match(/(\d+(?:\.\d+)?)\s*KW/);
+ if (kw) return parseFloat(kw[1]);
+ const w = name.match(/(\d+(?:\.\d+)?)\s*W\b/);
+ if (w) return parseFloat(w[1]) / 1000;
+ if (it.watt) return (Number(it.watt) || 0) / 1000;
+ const any = name.match(/(\d+(?:\.\d+)?)/);
+ return any ? parseFloat(any[1]) : Infinity;
+}
+// The leading letters of a model name are its series (R5/R6 -> "R", C6 -> "C", etc.), and staff
+// think in series first — all the R models together, then M, then H, then C — with capacity
+// ordering only applying inside each series.
+function itemSeries(it) {
+ const m = (it.name || "").toUpperCase().match(/^([A-Z]+)/);
+ return m ? m[1] : "";
+}
+function sortItemsByCapacity(list) {
+ return list.slice().sort((a, b) => {
+ if (a.category !== b.category) {
+ return ITEM_CATEGORIES.indexOf(a.category) - ITEM_CATEGORIES.indexOf(b.category);
+ }
+ const sa = itemSeries(a), sb = itemSeries(b);
+ if (sa !== sb) {
+ if (!sa) return 1; // models with no letter prefix (e.g. "650W" panels) sort last
+ if (!sb) return -1;
+ return sa.localeCompare(sb);
+ }
+ const ca = itemCapacity(a), cb = itemCapacity(b);
+ if (ca !== cb) return ca - cb;
+ return (a.name || "").localeCompare(b.name || "");
+ });
+}
+
+function emptyItem() { return { id: uid(), category: ITEM_CATEGORIES[0], name: "", watt: "", description: "", note: "", stockIns: [] }; }
+function normalizeItem(it) { return { ...emptyItem(), ...it, stockIns: (it && Array.isArray(it.stockIns)) ? it.stockIns : [] }; }
+
+// Stock tracking: shipped quantity is derived from Package Details / Install Status model
+// selections (guaranteed to match the Item Directory's model name exactly, since both are
+// picked via ItemPicker) — never from the freeform Delivery Order hardware checklist.
+function shippedKey(category, model) { return `${category}::${(model || "").trim().toLowerCase()}`; }
+function computeShippedByModel(cases) {
+ const map = {};
+ const add = (category, model, qty) => {
+ if (!model || !String(model).trim()) return;
+ const key = shippedKey(category, model);
+ map[key] = (map[key] || 0) + (Number(qty) || 0);
+ };
+ cases.forEach(c => {
+ if (c.cancellation && c.cancellation.isCancelled) return; // cancelled cases never shipped
+ // Stock only leaves the warehouse when a component is actually installed — a package sold
+ // today might not be installed for months, so an install DATE (not just the model being
+ // quoted) is what counts as shipped. Each component is checked against its own date.
+ if (c.install.panel.date && c.pkg.panelModel) add("Panel", c.pkg.panelModel, c.pkg.panelCount || 0);
+ if (c.install.inverter.date && c.pkg.inverterModel) add("Inverter", c.pkg.inverterModel, 1);
+ if (c.install.inverter.date) (c.pkg.inverterEntries || []).forEach(e => { if (e.model) add("Inverter", e.model, e.qty || 1); });
+ // Battery/EV Charger are quoted in Package Details but installed (and therefore shipped) per
+ // the Install tab's date. Prefer the Package Details model — that's the one Admin fills when
+ // selling — and fall back to the Install tab's model if it was only recorded there.
+ const batteryModel = (c.pkg.battery && c.pkg.battery.model) || c.install.battery.model;
+ const batteryQty = (c.pkg.battery && c.pkg.battery.qty) || c.install.battery.qty || 1;
+ if (c.install.battery.date && batteryModel) add("Battery", batteryModel, batteryQty);
+
+ const evModel = (c.pkg.evCharger && c.pkg.evCharger.model) || c.install.ev.model;
+ const evQty = (c.pkg.evCharger && c.pkg.evCharger.qty) || c.install.ev.qty || 1;
+ if (c.install.ev.date && evModel && suppliesGoods(c)) add("EV Charger", evModel, evQty);
+
+ if (c.install.capBank.date && c.install.capBank.model) add("Cap Bank", c.install.capBank.model, c.install.capBank.qty || 1);
+ });
+ return map;
+}
+function stockInTotal(item) { return (item.stockIns || []).reduce((s, r) => s + (Number(r.qty) || 0), 0); }
+function computeItemStock(item, shippedMap) {
+ const stockIn = stockInTotal(item);
+ const shipped = shippedMap[shippedKey(item.category, item.name)] || 0;
+ return { stockIn, shipped, remaining: stockIn - shipped };
+}
+async function loadItemDirectory() {
+ try {
+ const res = await storage.get("itemDirectory", true);
+ const raw = res ? JSON.parse(res.value) : [];
+ return raw.map(normalizeItem);
+ } catch { return []; }
+}
+async function saveItemDirectory(list) {
+ try { await storage.set("itemDirectory", JSON.stringify(list), true); } catch (e) { console.error(e); }
+}
+
+// ---------- Shipment Batches ----------
+// A real, persistent working tool (not a printed report) that mirrors how goods actually go
+// out: in batches, not one customer at a time. Admin adds customers to a batch by name; each
+// customer's items (model/qty) are pulled automatically from their case — never re-typed. Items
+// are then summed together across the whole batch, and the ship date for each item type is
+// typed once per batch (since a whole batch of the same item usually ships together).
+function emptyShipmentBatch() {
+ return { id: uid(), label: "", createdAt: todayISO(), caseIds: [], shipDates: {}, note: "" };
+}
+function normalizeShipmentBatch(b) {
+ return { ...emptyShipmentBatch(), ...b, caseIds: Array.isArray(b.caseIds) ? b.caseIds : [], shipDates: b.shipDates || {} };
+}
+async function loadShipmentBatches() {
+ try {
+ const res = await storage.get("shipmentBatches", true);
+ const raw = res ? JSON.parse(res.value) : [];
+ return raw.map(normalizeShipmentBatch);
+ } catch { return []; }
+}
+async function saveShipmentBatches(list) {
+ try { await storage.set("shipmentBatches", JSON.stringify(list), true); } catch (e) { console.error(e); }
+}
+
+// ---------- Document Log ----------
+// Quotation/Proforma Invoice used to be generated purely on the fly with nothing saved — Admin
+// had no way to see what an Agent actually printed or told a customer to pay. Every generation
+// now writes a permanent log entry here (who, when, which case, which doc, and for an invoice,
+// the exact amount + note), so it can be audited later.
+async function loadDocLogs() {
+ try {
+ const res = await storage.get("docLogs", true);
+ return res ? JSON.parse(res.value) : [];
+ } catch { return []; }
+}
+async function saveDocLogs(list) {
+ try { await storage.set("docLogs", JSON.stringify(list), true); } catch (e) { console.error(e); }
+}
+// Pulls this case's shippable items as a flat list of {key, label, model, qty} — key is stable
+// per item type so quantities for the same model can be summed across every case in a batch.
+function caseShipItems(c) {
+ const items = [];
+ if (c.pkg.panelModel) items.push({ key: "panel", label: "Panel", model: `${c.pkg.panelSizeW || "-"}W`, qty: Number(c.pkg.panelCount) || 0 });
+ if (c.pkg.inverterModel) items.push({ key: "inverter", label: "Inverter", model: c.pkg.inverterModel, qty: 1 });
+ (c.pkg.inverterEntries || []).forEach(e => {
+ if (e.model) items.push({ key: "inverter", label: "Inverter", model: e.model, qty: Number(e.qty) || 1 });
+ });
+ // Panel/Inverter ship based on what the package quoted, with no separate tick needed —
+ // Battery now follows the same rule, since new staff kept forgetting to tick it in the
+ // Install tab and the item silently dropped off delivery/shipment lists as a result.
+ const bModel = (c.pkg.battery && c.pkg.battery.model) || c.install.battery.model;
+ if (bModel) items.push({ key: "battery", label: "Battery", model: bModel, qty: Number((c.pkg.battery && c.pkg.battery.qty) || c.install.battery.qty) || 1 });
+ const eModel = (c.pkg.evCharger && c.pkg.evCharger.model) || c.install.ev.model;
+ if (c.install.ev.applicable && eModel && suppliesGoods(c)) items.push({ key: "ev", label: "EV Wallbox", model: eModel, qty: Number((c.pkg.evCharger && c.pkg.evCharger.qty) || c.install.ev.qty) || 1 });
+ if (c.install.capBank.applicable && c.install.capBank.model) items.push({ key: "capBank", label: "Cap Bank", model: c.install.capBank.model, qty: Number(c.install.capBank.qty) || 1 });
+ return items;
+}
+// Sums every case's items in a batch together by (key + model) — same shape used in the batch
+// detail view's totals table — then checks which of those lines still have no ship date typed
+// in, so the batch list can flag "still has unshipped items" at a glance.
+function batchItemTotals(batch, cases) {
+ const batchCases = batch.caseIds.map(id => cases.find(c => c.id === id)).filter(Boolean);
+ const totals = {};
+ const order = [];
+ batchCases.forEach(c => {
+ caseShipItems(c).forEach(it => {
+ const tk = `${it.key}::${it.model}`;
+ if (!totals[tk]) { totals[tk] = { ...it, qty: 0 }; order.push(tk); }
+ totals[tk].qty += it.qty;
+ });
+ });
+ return { totals, order };
+}
+function batchPendingCount(batch, cases) {
+ const { order } = batchItemTotals(batch, cases);
+ return order.filter(tk => !batch.shipDates[tk]).length;
+}
+
+// ---------- Delivery Orders (standalone, one case per DO, multiple DOs per case allowed) ----------
+// A case's goods often go out over several deliveries (e.g. Panel + ATS now, Battery later), so a
+// DO is its own record rather than a single field on the case. Each DO only carries the items that
+// actually ship on it; how much of each item is still outstanding for a case is worked out by
+// summing every other DO already issued for that same case.
+const DO_ADDRESS_OPTIONS = [
+ { key: "install", label: "Installation Address (from Package Details)" },
+ { key: "klang", label: "Klang Warehouse" },
+ { key: "kluang", label: "Eternalgy Kluang Office" },
+ { key: "custom", label: "Other (type manually)" },
+];
+const DO_FIXED_ADDRESSES = {
+ klang: "8 Jalan Permata 8A/KS09, Taman Perindustrian Air Hitam, 41200 Klang, Selangor",
+ kluang: "26, Jalan Tasik Indah 1/1, Taman Tasik Indah, 86000 Kluang, Johor",
+};
+function resolveDOAddress(d, caseObj) {
+ if (d.addressType === "klang") return DO_FIXED_ADDRESSES.klang;
+ if (d.addressType === "kluang") return DO_FIXED_ADDRESSES.kluang;
+ if (d.addressType === "custom") return d.customAddress || "-";
+ return (caseObj && caseObj.installAddress) || "-";
+}
+// The Warehouse Manager role doesn't change from delivery to delivery, so it's a fixed constant
+// rather than something Admin re-types on every DO.
+const WAREHOUSE_MANAGER_NAME = "WEI HAO";
+
+// ---------- WhatsApp notifications ----------
+// A fixed line the company already uses to talk to customers — Agents don't message customers
+// directly on their own WhatsApp, everything routes through this number or the Agent's own.
+const CUSTOMER_SERVICE_PHONE = "018-3500422";
+// wa.me links need digits-only, country-code-first (Malaysia = 60, dropping the leading 0).
+function normalizePhoneForWhatsApp(phone) {
+ if (!phone) return "";
+ let digits = String(phone).replace(/\D/g, "");
+ if (!digits) return "";
+ if (digits.startsWith("0")) digits = "60" + digits.slice(1);
+ else if (!digits.startsWith("60")) digits = "60" + digits;
+ return digits;
+}
+function openWhatsApp(phone, text) {
+ const digits = normalizePhoneForWhatsApp(phone);
+ if (!digits) { alert("No phone number on file to send this to."); return; }
+ window.open(`https://wa.me/${digits}?text=${encodeURIComponent(text)}`, "_blank");
+}
+function agentPhoneFor(c, agentDirectory) {
+ const a = (agentDirectory || []).find(x => x.name === c.agentName);
+ return a ? a.phone : "";
+}
+function buildDOWhatsAppText(c, d) {
+ const lines = [];
+ lines.push("*Delivery Order — Please Confirm Goods*", "");
+ lines.push(`Customer: ${c.customerName || "-"}`);
+ lines.push(`Contact: ${c.customerPhone || "-"}`);
+ lines.push(`Installation Address: ${c.installAddress || "-"}`, "");
+ lines.push("Please double-check these against the customer's package before we ship:");
+ (d.items || []).forEach((it, i) => lines.push(`${i + 1}. ${it.label}${it.model ? ` - ${it.model}` : ""} x${it.qty}`));
+ (d.checklist || []).filter(it => it.name && it.qty).forEach((it, i) => lines.push(`${(d.items || []).length + i + 1}. ${it.name}${it.model ? ` - ${it.model}` : ""} x${it.qty}`));
+ lines.push("", "Reply to confirm, or flag if the package changed and this needs updating.");
+ return lines.join("\n");
+}
+function buildPaymentWhatsAppText(c, record, index) {
+ return [
+ "*Payment Verified*", "",
+ `Customer: ${c.customerName || "-"}`,
+ `Payment #${index + 1}: RM ${record.amount || "0"}`,
+ `Verified: ${record.verifiedDate ? fmtDate(record.verifiedDate) : "-"}`, "",
+ "This payment has been verified — no need to re-upload proof for this one.",
+ ].join("\n");
+}
+function buildSedaWhatsAppText(c, stage) {
+ const lines = ["*Eternalgy Project Status Update*", "", `Customer: ${c.customerName || "-"}`];
+ if (stage === "approved") {
+ lines.push(
+ "Status: *SEDA Approved*",
+ `Certification No: ${c.seda.certificationNo || "-"}`,
+ `Approval Date: ${c.seda.approvalDate ? fmtDate(c.seda.approvalDate) : "-"}`,
+ );
+ if (c.seda.eotDate) lines.push(`EOT Date: ${fmtDate(c.seda.eotDate)}`);
+ lines.push("", "Your SEDA application has been *approved*.");
+ } else {
+ lines.push(
+ "Status: *SEDA Submitted*",
+ `Application Number: ${c.seda.certificationNo || "-"}`,
+ `Date: ${c.seda.submitDate ? fmtDate(c.seda.submitDate) : "-"}`, "",
+ "Your SEDA application has been *submitted*.",
+ "We will keep you updated once approval is received.",
+ );
+ }
+ lines.push("", "Thank you for choosing Eternalgy.");
+ return lines.join("\n");
+}
+function buildTnbWhatsAppText(c, stage) {
+ const lines = ["*Eternalgy Project Status Update*", "", `Customer: ${c.customerName || "-"}`];
+ if (stage === "approved") {
+ lines.push(
+ "Status: *TNB Approved*",
+ `TNB Account No: ${c.tnb.tnbAccount || "-"}`,
+ `Welcome Letter Date: ${c.tnb.welcomeDate ? fmtDate(c.tnb.welcomeDate) : "-"}`, "",
+ "Your TNB application has been *approved*. Welcome Letter received.",
+ );
+ } else {
+ lines.push(
+ "Status: *TNB Application Submitted*",
+ `Date: ${c.tnb.applyDate ? fmtDate(c.tnb.applyDate) : "-"}`, "",
+ "Your TNB application has been *submitted*.",
+ "We will keep you updated once approved.",
+ );
+ }
+ lines.push("", "Thank you for choosing Eternalgy.");
+ return lines.join("\n");
+}
+function emptyDeliveryOrder() {
+ const now = new Date();
+ return {
+ id: uid(),
+ caseId: "",
+ date: todayISO(),
+ doYear: String(now.getFullYear()),
+ doMonth: String(now.getMonth() + 1).padStart(2, "0"),
+ doSerial: "",
+ addressType: "install",
+ customAddress: "",
+ items: [], // [{ tk, key, label, model, qty }] — quantity-tracked against the case's package
+ // Freeform accessory checklist (Tile Hook, brackets, clamps, rails...) — these were never
+ // quantity-tracked per case, so each DO gets its own editable list, same as the old design.
+ checklist: DEFAULT_DO_ITEMS.filter(name => name !== "Solar Panel" && name !== "Inverter")
+ .map(name => ({ id: uid(), name, model: "", qty: "" })),
+ pickupDateTime: "", deliveryDate: "", deliveryTimeStart: "", deliveryTimeEnd: "",
+ driverName: "", driverPhone: "", lorryNo: "",
+ // Warehouse Manager is a fixed role, not something that changes per DO — Admin only fills in
+ // the sign-off date, never re-types the name.
+ materialPlanner: "", materialPlannerDate: "", warehouseManager: WAREHOUSE_MANAGER_NAME, warehouseManagerDate: "",
+ remarks: "**Call before delivery.",
+ note: "",
+ };
+}
+function normalizeDeliveryOrder(d) {
+ const base = emptyDeliveryOrder();
+ return {
+ ...base, ...d,
+ items: Array.isArray(d.items) ? d.items : [],
+ checklist: (Array.isArray(d.checklist) && d.checklist.length) ? d.checklist : base.checklist,
+ warehouseManager: WAREHOUSE_MANAGER_NAME,
+ };
+}
+async function loadDeliveryOrders() {
+ try {
+ const res = await storage.get("deliveryOrders", true);
+ const raw = res ? JSON.parse(res.value) : [];
+ return raw.map(normalizeDeliveryOrder);
+ } catch { return []; }
+}
+async function saveDeliveryOrdersList(list) {
+ try { await storage.set("deliveryOrders", JSON.stringify(list), true); } catch (e) { console.error(e); }
+}
+// e.g. DO-202606-001. The serial is deliberately left for Admin to type by hand, since it maps to
+// a physical, sequentially-numbered paper trail they may already be keeping.
+function doNumberDisplay(d) {
+ return `DO-${d.doYear}${d.doMonth}-${d.doSerial || "___"}`;
+}
+// Everything a case is entitled to ship, in the same shape as caseShipItems but also including
+// freeform "Other" goods (where ATS/Ballast/etc. are usually entered) since those are just as
+// real for delivery-tracking purposes. FOC give-aways are excluded — nothing to track shipping for.
+function caseOrderedItems(c) {
+ const items = caseShipItems(c);
+ (c.pkg.otherEntries || []).forEach(e => {
+ if (!e.name || /\bFOC\b/i.test(e.name)) return;
+ items.push({ key: "other", label: "Other", model: e.name, qty: Number(e.qty) || 1 });
+ });
+ return items;
+}
+// Sums, per item (key+model), how much of a case's goods have already gone out across every OTHER
+// delivery order already issued for that case — so a new DO can default to exactly what's left.
+function shippedQtyByItemForCase(caseId, deliveryOrders, excludeDoId) {
+ const map = {};
+ (deliveryOrders || []).forEach(d => {
+ if (d.caseId !== caseId || d.id === excludeDoId) return;
+ (d.items || []).forEach(it => { map[it.tk] = (map[it.tk] || 0) + (Number(it.qty) || 0); });
+ });
+ return map;
+}
+function buildDOPrintDoc(d, c) {
+ const doNo = doNumberDisplay(d);
+ const address = resolveDOAddress(d, c);
+ // When it's just the install address, print "same as above" rather than repeating the full
+ // text a second time — matches how the case-level DO used to read.
+ const addressCell = d.addressType === "install" ? "same as above" : address;
+ const installDateStr = c.install.deliveryDate
+ ? `${fmtDate(c.install.deliveryDate)}${c.delivery.installTimeSlot ? ` - ${c.delivery.installTimeSlot}` : ""}${c.delivery.installTime ? ` @${c.delivery.installTime}` : ""}`
+ : "-";
+ const trackedRows = (d.items || []).map((it, i) => `<tr>
+ <td style="padding:5px 8px;border:1px solid #ccc;font-weight:bold;">${i + 1}. ${it.label}${it.model ? ` - ${it.model}` : ""}</td>
+ <td style="padding:5px 8px;border:1px solid #ccc;text-align:center;font-weight:bold;color:#2C5F8A;">${it.qty}</td>
+ <td style="padding:5px 8px;border:1px solid #ccc;text-align:center;">☐</td>
+ <td style="padding:5px 8px;border:1px solid #ccc;text-align:center;">☐</td>
+ <td style="padding:5px 8px;border:1px solid #ccc;text-align:center;">☐</td>
+ </tr>`).join("");
+ // Accessory checklist (rails, clamps, brackets...) — each DO keeps its own editable list, since
+ // these were never quantity-tracked against the case; Admin types the real count per delivery,
+ // same as the old per-case checklist worked.
+ const checklistRows = (d.checklist || []).map((it, i) => `<tr>
+ <td style="padding:5px 8px;border:1px solid #ccc;">${(d.items || []).length + i + 1}. ${it.name || "-"}</td>
+ <td style="padding:5px 8px;border:1px solid #ccc;text-align:center;color:#2C5F8A;">${it.qty || "-"}</td>
+ <td style="padding:5px 8px;border:1px solid #ccc;text-align:center;">☐</td>
+ <td style="padding:5px 8px;border:1px solid #ccc;text-align:center;">☐</td>
+ <td style="padding:5px 8px;border:1px solid #ccc;text-align:center;">☐</td>
+ </tr>`).join("");
+ const rows = trackedRows + checklistRows;
+ const html = `
+ <div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #0B2A4A;padding-bottom:10px;">
+ <div>
+ <div style="font-weight:bold;font-size:15px;color:#0B2A4A;">ETERNALGY SDN. BHD.</div>
+ <div style="font-size:10px;color:#666;line-height:1.5;">23-01 JALAN MUTIARA EMAS 10/19 TAMAN MOUNT AUSTIN<br/>81100 JOHOR BAHRU JOHOR MALAYSIA</div>
+ </div>
+ <div style="text-align:right;">
+ <div style="font-size:11px;color:#666;">Delivery Order</div>
+ <div style="font-size:13px;font-weight:bold;">No. <span style="color:#C24141;">${doNo}</span></div>
+ </div>
+ </div>
+ <div style="margin-top:14px;font-weight:bold;font-size:12.5px;">A. CLIENT INFORMATION</div>
+ <table style="width:100%;font-size:12px;margin-top:4px;border-collapse:collapse;">
+ <tr><td style="width:150px;color:#666;padding:3px 0;">Customer Name</td><td style="font-weight:bold;">${c.customerName || "-"}</td></tr>
+ <tr><td style="color:#666;padding:3px 0;">Service Agent</td><td>${agentDisplay(c)}</td></tr>
+ <tr><td style="color:#666;padding:3px 0;">Contact number</td><td>${c.customerPhone || "-"}</td></tr>
+ <tr><td style="color:#666;padding:3px 0;">Installation Date</td><td><b>${installDateStr}</b></td></tr>
+ <tr><td style="color:#666;padding:3px 0;">Installation Address</td><td>${c.installAddress || "-"}</td></tr>
+ <tr><td style="color:#666;padding:3px 0;">Delivery Address</td><td>${addressCell}</td></tr>
+ <tr><td style="color:#666;padding:3px 0;">Remarks</td><td>${d.remarks || "-"}</td></tr>
+ </table>
+ <div style="margin-top:16px;font-weight:bold;font-size:12.5px;">B. Delivery Details</div>
+ <table style="width:100%;font-size:12px;margin-top:4px;border-collapse:collapse;">
+ <tr>
+ <td style="width:140px;color:#666;padding:3px 0;">Delivery Pick up</td><td>${d.pickupDateTime || "-"}</td>
+ <td style="width:110px;color:#666;padding:3px 0;">Driver name</td><td>${d.driverName || "-"}</td>
+ </tr>
+ <tr>
+ <td style="color:#666;padding:3px 0;">Delivery Date</td><td>${d.deliveryDate ? fmtDate(d.deliveryDate) : "-"}</td>
+ <td style="color:#666;padding:3px 0;">Driver Phone</td><td>${d.driverPhone || "-"}</td>
+ </tr>
+ <tr>
+ <td style="color:#666;padding:3px 0;">Delivery Time</td><td>${d.deliveryTimeStart || "-"} - ${d.deliveryTimeEnd || "-"}</td>
+ <td style="color:#666;padding:3px 0;">Lorry no.</td><td>${d.lorryNo || "-"}</td>
+ </tr>
+ </table>
+ <div style="margin-top:14px;font-weight:bold;font-size:12.5px;">Deliver Items List</div>
+ <table style="width:100%;border-collapse:collapse;font-size:11.5px;margin-top:4px;">
+ <thead><tr style="background:#F5F3ED;">
+ <th style="padding:6px 8px;border:1px solid #ccc;text-align:left;">Product / Model</th>
+ <th style="padding:6px 8px;border:1px solid #ccc;">Quantity</th>
+ <th style="padding:6px 8px;border:1px solid #ccc;">Packer</th>
+ <th style="padding:6px 8px;border:1px solid #ccc;">Driver</th>
+ <th style="padding:6px 8px;border:1px solid #ccc;">Recipient</th>
+ </tr></thead>
+ <tbody>${rows || `<tr><td colspan="5" style="padding:10px;text-align:center;color:#999;">No items on this DO</td></tr>`}</tbody>
+ </table>
+ <table style="width:100%;font-size:11.5px;margin-top:10px;">
+ <tr>
+ <td style="color:#666;padding:3px 0;width:150px;">Material Planner</td><td style="font-weight:bold;">${d.materialPlanner || "-"}</td>
+ <td style="color:#666;padding:3px 0;width:150px;">Warehouse Manager</td><td style="font-weight:bold;">${d.warehouseManager || "-"}</td>
+ </tr>
+ <tr>
+ <td style="color:#666;padding:3px 0;">Date</td><td>${d.materialPlannerDate ? fmtDate(d.materialPlannerDate) : "-"}</td>
+ <td style="color:#666;padding:3px 0;">Date</td><td>${d.warehouseManagerDate ? fmtDate(d.warehouseManagerDate) : "-"}</td>
+ </tr>
+ </table>
+ <div style="margin-top:18px;font-weight:bold;font-size:12.5px;">Acknowledgement</div>
+ <table style="width:100%;border-collapse:collapse;margin-top:6px;font-size:11.5px;">
+ <tr style="background:#F5F3ED;">
+ <th style="padding:6px;border:1px solid #ccc;width:33%;">Packer</th>
+ <th style="padding:6px;border:1px solid #ccc;width:33%;">Deliver</th>
+ <th style="padding:6px;border:1px solid #ccc;width:34%;">Recipient</th>
+ </tr>
+ <tr>
+ <td style="border:1px solid #ccc;height:56px;vertical-align:bottom;padding:4px;">Sign:</td>
+ <td style="border:1px solid #ccc;height:56px;vertical-align:bottom;padding:4px;">Sign:</td>
+ <td style="border:1px solid #ccc;height:56px;vertical-align:bottom;padding:4px;">Sign:<br/><span style="font-size:9px;color:#999;">(Company Stamp if applicable)</span></td>
+ </tr>
+ </table>
+ <div style="margin-top:10px;font-size:10.5px;color:#666;">This delivery note serves as proof of delivery. Please check and sign upon receipt.</div>`;
+ return { title: `Delivery Order ${doNo}`, html };
+}
+// Report for Warehouse: how many DOs went out in a given range, so staff can check monthly counts
+// against their own paper log.
+function buildDOReportDoc(startDate, endDate, deliveryOrders, cases) {
+ const list = (deliveryOrders || []).filter(d => inRange(d.date, startDate, endDate)).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+ const rows = list.map(d => {
+ const c = cases.find(cc => cc.id === d.caseId);
+ return trHtml([fmtDate(d.date), doNumberDisplay(d), c ? (c.customerName || "-") : "Not set", (d.items || []).length]);
+ }).join("");
+ const html = `${buildLetterheadHtml()}<h1 style="font-size:18px;margin:14px 0 6px;">Delivery Order Report &nbsp;—&nbsp; ${dateRangeLabel(startDate, endDate)}</h1>
+ ${styledTable(["Date", "DO Number", "Customer", "Item Lines"], rows || trHtml(["No DOs issued in this range", "", "", ""]))}
+ <div style="margin-top:14px;font-size:13px;">Total DOs issued: ${list.length}</div>`;
+ return { title: `Delivery Order Report ${startDate}~${endDate}`, html };
+}
+
+/* ---------- small UI atoms ---------- */
+
+function SunArc({ percent = 0, size = 44 }) {
+ const r = size / 2 - 4;
+ const c = 2 * Math.PI * r;
+ const offset = c - (percent / 100) * c;
+ return (
+ <div style={{ position: "relative", width: size, height: size }}>
+ <svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
+ <circle cx={size/2} cy={size/2} r={r} stroke="#E7E1D3" strokeWidth="4" fill="none" />
+ <circle cx={size/2} cy={size/2} r={r} stroke="url(#sunGrad)" strokeWidth="4" fill="none"
+ strokeDasharray={c} strokeDashoffset={offset} strokeLinecap="round" />
+ <defs>
+ <linearGradient id="sunGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+ <stop offset="0%" stopColor="#0B2A4A" />
+ <stop offset="100%" stopColor="#C89B3C" />
+ </linearGradient>
+ </defs>
+ </svg>
+ <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
+ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, fontWeight: 600, color: "#1B2430" }}>
+ {percent}%
+ </div>
+ </div>
+ );
+}
+
+function Badge({ children, color }) {
+ return (
+ <span style={{
+ display: "inline-flex", alignItems: "center", gap: 5, padding: "2px 8px",
+ borderRadius: 20, fontSize: 11, fontWeight: 600, color: "#fff",
+ backgroundColor: color, whiteSpace: "nowrap"
+ }}>
+ <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#fff", opacity: 0.85 }} />
+ {children}
+ </span>
+ );
+}
+
+function Field({ label, children, mono, style }) {
+ return (
+ <label style={{ display: "flex", flexDirection: "column", gap: 5, minWidth: 0, ...style }}>
+ <span style={{ fontSize: 11.5, fontWeight: 600, color: "#6B7686", letterSpacing: 0.3 }}>{label}</span>
+ {children}
+ </label>
+ );
+}
+
+const inputStyle = {
+ border: "1px solid #E2DDD0", borderRadius: 8, padding: "8px 10px", fontSize: 13.5,
+ fontFamily: "'Inter', sans-serif", background: "#fff", color: "#1B2430", outline: "none",
+ width: "100%", minWidth: 0, boxSizing: "border-box",
+};
+const inputMonoStyle = { ...inputStyle, fontFamily: "'IBM Plex Mono', monospace" };
+
+function TextInput(props) {
+ const { onChange, ...rest } = props;
+ return <input {...rest} onChange={e => onChange && onChange({ target: { value: e.target.value.toUpperCase() } })}
+ style={{ ...inputStyle, textTransform: "uppercase", ...(props.style||{}) }} />;
+}
+function DateInput(props) { return <input type="date" min={DATE_MIN} {...props} style={{ ...inputMonoStyle, ...(props.style||{}) }} />; }
+// Native <input type="date"> always shows/enters the browser & OS's own locale format (often
+// mm/dd/yyyy for US-language systems) — that can't be overridden with CSS or props, it's outside
+// the page's control. This is a plain text field with auto "/" masking instead, so typing is
+// guaranteed DD/MM/YYYY regardless of the device it's used on. Value in/out is still ISO
+// (yyyy-mm-dd), so it's a drop-in replacement wherever DateInput is used.
+function DateInputDMY({ value, onChange, style, ...rest }) {
+ const toDisplay = (iso) => {
+ if (!iso || iso.length < 10) return "";
+ const [y, m, d] = iso.split("-");
+ return `${d}/${m}/${y}`;
+ };
+ const [text, setText] = useState(toDisplay(value));
+ useEffect(() => { setText(toDisplay(value)); }, [value]);
+ const handleChange = (e) => {
+ const digits = e.target.value.replace(/[^0-9]/g, "").slice(0, 8); // ddmmyyyy
+ let formatted = digits;
+ if (digits.length > 4) formatted = `${digits.slice(0, 2)}/${digits.slice(2, 4)}/${digits.slice(4)}`;
+ else if (digits.length > 2) formatted = `${digits.slice(0, 2)}/${digits.slice(2)}`;
+ setText(formatted);
+ if (digits.length === 8) {
+ const d = digits.slice(0, 2), m = digits.slice(2, 4), y = digits.slice(4, 8);
+ onChange({ target: { value: `${y}-${m}-${d}` } });
+ } else if (digits.length === 0) {
+ onChange({ target: { value: "" } });
+ }
+ };
+ return <input type="text" inputMode="numeric" placeholder="DD/MM/YYYY" value={text} onChange={handleChange}
+ style={{ ...inputMonoStyle, ...(style || {}) }} {...rest} />;
+}
+function NumberInput(props) { return <input type="number" {...props} style={{ ...inputMonoStyle, ...(props.style||{}) }} />; }
+function Select({ options, ...props }) {
+ return (
+ <select {...props} style={{ ...inputStyle, ...(props.style||{}) }}>
+ {options.map(o => {
+ const isObj = o && typeof o === "object";
+ const val = isObj ? o.value : o;
+ const lbl = isObj ? o.label : o;
+ return <option key={val} value={val}>{lbl}</option>;
+ })}
+ </select>
+ );
+}
+function TextArea(props) {
+ const { onChange, rows, ...rest } = props;
+ return <textarea {...rest} rows={rows || 2} onChange={e => onChange && onChange({ target: { value: e.target.value.toUpperCase() } })}
+ style={{ ...inputStyle, resize: "vertical", fontFamily: "'Inter', sans-serif", textTransform: "uppercase", ...(props.style||{}) }} />;
+}
+
+function SectionCard({ dept, defaultOpen, children, right }) {
+ const [open, setOpen] = useState(!!defaultOpen);
+ const Icon = dept.icon;
+ return (
+ <div style={{ border: "1px solid #E9E4D8", borderRadius: 14, overflow: "hidden", background: "#fff" }}>
+ <button onClick={() => setOpen(o => !o)} style={{
+ width: "100%", display: "flex", alignItems: "center", gap: 10, padding: "13px 16px",
+ background: "#FBFAF6", border: "none", cursor: "pointer", textAlign: "left"
+ }}>
+ <div style={{ width: 30, height: 30, borderRadius: 9, background: dept.color, display: "flex",
+ alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+ <Icon size={16} color="#fff" />
+ </div>
+ <div style={{ flex: 1 }}>
+ <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 14.5, color: "#1B2430" }}>
+ {dept.cn} <span style={{ color: "#9AA2AD", fontWeight: 500, fontSize: 12 }}>{dept.label}</span>
+ </div>
+ </div>
+ {right}
+ {open ? <ChevronDown size={16} color="#9AA2AD" /> : <ChevronRight size={16} color="#9AA2AD" />}
+ </button>
+ {open && <div style={{ padding: 16, borderTop: "1px solid #F0ECE1", display: "flex", flexDirection: "column", gap: 14 }}>{children}</div>}
+ </div>
+ );
+}
+
+function AdminNote({ value, onChange, readOnly }) {
+ const addEntry = () => {
+ const dateStr = fmtDate(todayISO()); // DD/MM/YY, same convention as the rest of the app
+ const prefix = value && value.trim() ? "\n" : "";
+ onChange({ target: { value: `${value || ""}${prefix}[${dateStr}] ` } });
+ };
+ return (
+ <div style={{ background: "#FBF8F0", border: "1px dashed #E3D8B8", borderRadius: 10, padding: 10 }}>
+ <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, marginBottom: 6 }}>
+ <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+ <PenLine size={13} color="#B08A2E" />
+ <span style={{ fontSize: 11, fontWeight: 700, color: "#B08A2E", letterSpacing: 0.3 }}>ADMIN Admin Notes</span>
+ </div>
+ {!readOnly && (
+ <button onClick={addEntry} type="button" style={{ ...btnGhost, padding: "4px 10px", fontSize: 11.5, borderColor: "#E3D8B8", color: "#B08A2E" }}>
+ <Plus size={12}/> Add Record
+ </button>
+ )}
+ </div>
+ {readOnly ? (
+ <div style={{ fontSize: 13, color: value ? "#1B2430" : "#B5AE9E", fontStyle: value ? "normal" : "italic", whiteSpace: "pre-wrap", minHeight: 120 }}>
+ {value || "No notes"}
+ </div>
+ ) : (
+ <TextArea value={value} onChange={onChange} placeholder="Notes for Agent (can log multiple entries, date + content)" rows={3} style={{ background: "#fff", minHeight: 70, width: "100%" }} />
+ )}
+ </div>
+ );
+}
+
+/* ---------- Case Form (Admin add/edit) ---------- */
+
+function DeptTabBar({ active, onChange, packageType, caseType }) {
+ const tabs = tabsForPackageType(packageType, caseType);
+ return (
+ <div style={{ display: "flex", gap: 4, borderBottom: "1px solid #E9E4D8", overflowX: "auto", paddingBottom: 2 }}>
+ {tabs.map(key => {
+ const d = DEPT[key];
+ const Icon = d.icon;
+ const isActive = active === key;
+ return (
+ <button key={key} onClick={() => onChange(key)} style={{
+ display: "flex", alignItems: "center", gap: 6, padding: "10px 15px", borderRadius: "8px 8px 0 0",
+ border: "none", borderBottom: isActive ? `3px solid ${d.color}` : "3px solid transparent",
+ background: isActive ? d.color : "transparent",
+ color: isActive ? "#fff" : "#6B7686", fontWeight: isActive ? 700 : 600, fontSize: 13,
+ cursor: "pointer", whiteSpace: "nowrap", fontFamily: "'Inter', sans-serif", marginBottom: -3,
+ boxShadow: isActive ? "0 2px 6px rgba(0,0,0,0.12)" : "none",
+ }}>
+ <Icon size={14} /> {d.cn} <span style={{ opacity: 0.85, fontSize: 11.5 }}>{d.label}</span>
+ </button>
+ );
+ })}
+ </div>
+ );
+}
+
+function HeaderCard({ title, children }) {
+ return (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 16, flex: 1, minWidth: 280 }}>
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5, marginBottom: 12 }}>{title}</div>
+ {children}
+ </div>
+ );
+}
+
+// Two ways to reach the customer, chosen per click — Agents don't message customers on their
+// own WhatsApp, so it always routes through the shared Customer Service line or the Agent's own
+// number (who has their own relationship with that customer).
+function WhatsAppNotifyBlock({ label, agentPhone, stages }) {
+ return (
+ <div style={{ borderTop: "1px solid #F0ECE1", paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5 }}>NOTIFY CUSTOMER — WHATSAPP</div>
+ {stages.map(s => (
+ <div key={s.key} style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+ <span style={{ fontSize: 12, color: "#6B7686", minWidth: 100 }}>{label} {s.label}:</span>
+ <button onClick={() => openWhatsApp(CUSTOMER_SERVICE_PHONE, s.text)} style={{ ...btnGhost, padding: "5px 10px", fontSize: 11.5 }}>
+ Send → Customer Service
+ </button>
+ <button onClick={() => openWhatsApp(agentPhone, s.text)} disabled={!agentPhone}
+ style={{ ...btnGhost, padding: "5px 10px", fontSize: 11.5, opacity: agentPhone ? 1 : 0.4, cursor: agentPhone ? "pointer" : "not-allowed" }}>
+ Send → Agent
+ </button>
+ </div>
+ ))}
+ {!agentPhone && <div style={{ fontSize: 10.5, color: "#B5AE9E" }}>This case's Agent has no phone number on file — add one under Agent to enable that option.</div>}
+ </div>
+ );
+}
+function TabHistory({ c, deptKey }) {
+ const [showAll, setShowAll] = useState(false);
+ const dept = DEPT[deptKey];
+ const label = dept ? dept.label : deptKey;
+ // History written before departments were stored as keys used a display label instead, so
+ // accept either form rather than losing the older entries.
+ const entries = (c.editHistory || []).filter(h => {
+ if (!h.departments) return false;
+ return h.departments.some(d =>
+ d === deptKey || d === label || (dept && d === `${dept.cn} ${dept.label}`)
+ );
+ });
+ if (entries.length === 0) return null;
+ return (
+ <div style={{ background: "#FBFAF6", border: "1px solid #F0ECE1", borderRadius: 10, padding: "10px 14px" }}>
+ <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+ <span style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5 }}>
+ EDIT HISTORY — {label} ({entries.length}){!showAll && entries.length > 5 ? ", showing latest 5" : ""}
+ </span>
+ {entries.length > 5 && (
+ <button onClick={() => setShowAll(v => !v)} style={{ border: "none", background: "none", color: "#2C5F8A", fontSize: 11.5, fontWeight: 600, cursor: "pointer" }}>
+ {showAll ? "Collapse" : `View All (${entries.length})`}
+ </button>
+ )}
+ </div>
+ <div style={{ display: "flex", flexDirection: "column", gap: 3, maxHeight: showAll ? 260 : "none", overflowY: showAll ? "auto" : "visible" }}>
+ {(showAll ? entries.slice().reverse() : entries.slice(-5).reverse()).map(h => (
+ <div key={h.id} style={{ fontSize: 12, color: "#6B7686" }}>
+ {(() => { const dt = new Date(h.timestamp); const iso = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,"0")}-${String(dt.getDate()).padStart(2,"0")}`; return `${fmtDate(iso)} ${dt.toLocaleTimeString("en-MY", { hour: "2-digit", minute: "2-digit" })}`; })()} — {h.editor}
+ {/* Older entries saved before field-level diffing existed have no .details — they still show
+ the timestamp/editor line above with nothing further, rather than an empty bullet. */}
+ {h.details && h.details[deptKey] && h.details[deptKey].length > 0 && (
+ <ul style={{ margin: "2px 0 4px", paddingLeft: 18 }}>
+ {h.details[deptKey].map((line, i) => (
+ <li key={i} style={{ fontSize: 11.5, color: "#8A93A0" }}>{line}</li>
+ ))}
+ </ul>
+ )}
+ </div>
+ ))}
+ </div>
+ </div>
+ );
+}
+
+function CaseForm({ initial, onSave, onCancel, onDelete, agentDirectory, itemDirectory, logDoc, actorName }) {
+ const [c, setC] = useState(initial);
+ // After Save, the parent hands back the just-saved case (with the new edit-history entry
+ // attached) as a fresh `initial` — but this form's own state was only seeded from `initial`
+ // once, on mount, so without this it silently missed every entry created by its own Save
+ // click until the case was closed and reopened. Only the history field is synced (not the
+ // rest of `c`), so it can't clobber anything the admin is still mid-typing elsewhere.
+ useEffect(() => { setC(prev => ({ ...prev, editHistory: initial.editHistory })); }, [initial.editHistory]);
+ // Package Details having a battery model means the customer bought one — the Install tab's
+ // tick should reflect that automatically rather than depend on someone remembering to check
+ // it by hand. Only fires when the battery model text itself changes, so it won't fight a
+ // deliberate un-tick made afterwards for an unrelated edit.
+ useEffect(() => {
+ if (c.pkg.battery.model && !c.install.battery.applicable) {
+ setC(prev => ({ ...prev, install: { ...prev.install, battery: {
+ ...prev.install.battery, applicable: true,
+ model: prev.install.battery.model || prev.pkg.battery.model,
+ qty: prev.install.battery.qty || prev.pkg.battery.qty,
+ } } }));
+ }
+ }, [c.pkg.battery.model]);
+ const [tab, setTab] = useState("package");
+ const [linkCopied, setLinkCopied] = useState("");
+ const [eppInput, setEppInput] = useState({ bank: "", months: "", ratePct: "", totalAmount: "" });
+ const [savedFlash, setSavedFlash] = useState(false);
+ // Package specs start expanded on a brand-new case (nothing keyed in yet) and collapsed on an
+ // existing one, since Admins opening a saved case usually only want to read the description.
+ const [specsOpen, setSpecsOpen] = useState(!initial.customerName);
+ const setPrintDoc = useContext(PrintContext);
+ useEffect(() => {
+ if (!tabsForPackageType(c.pkg.packageType, c.pkg.caseType).includes(tab)) setTab("package");
+ }, [c.pkg.packageType]);
+ const set = (path, value) => {
+ setC(prev => {
+ const next = structuredClone(prev);
+ let ref = next;
+ const parts = path.split(".");
+ for (let i = 0; i < parts.length - 1; i++) ref = ref[parts[i]];
+ ref[parts[parts.length - 1]] = value;
+ return next;
+ });
+ };
+
+ const addPayment = () => setC(prev => ({ ...prev, payment: { ...prev.payment,
+ records: [...prev.payment.records, { id: uid(), date: "", amount: "", bank: "", paymentMode: "", note: "", verifiedDate: "" }] } }));
+ const updatePayment = (id, field, value) => setC(prev => ({ ...prev, payment: { ...prev.payment,
+ records: prev.payment.records.map(r => r.id === id ? { ...r, [field]: value } : r) } }));
+ const removePayment = (id) => setC(prev => ({ ...prev, payment: { ...prev.payment,
+ records: prev.payment.records.filter(r => r.id !== id) } }));
+
+ const addOM = () => setC(prev => ({ ...prev, om: { ...prev.om,
+ records: [...prev.om.records, { id: uid(), reportDate: todayISO(), issueType: ISSUE_TYPES[0], issueDetail: "", scheduledDate: "", resolvedDate: "" }] } }));
+ const updateOM = (id, field, value) => setC(prev => ({ ...prev, om: { ...prev.om,
+ records: prev.om.records.map(r => r.id === id ? { ...r, [field]: value } : r) } }));
+ const removeOM = (id) => setC(prev => ({ ...prev, om: { ...prev.om,
+ records: prev.om.records.filter(r => r.id !== id) } }));
+
+ const addDOItem = () => setC(prev => ({ ...prev, delivery: { ...prev.delivery,
+ items: [...prev.delivery.items, { id: uid(), name: "", model: "", qty: "" }] } }));
+ const updateDOItem = (id, field, value) => setC(prev => ({ ...prev, delivery: { ...prev.delivery,
+ items: prev.delivery.items.map(it => it.id === id ? { ...it, [field]: value } : it) } }));
+ const removeDOItem = (id) => setC(prev => ({ ...prev, delivery: { ...prev.delivery,
+ items: prev.delivery.items.filter(it => it.id !== id) } }));
+
+ const addInstallOther = () => setC(prev => ({ ...prev, install: { ...prev.install,
+ otherItems: [...prev.install.otherItems, { id: uid(), name: "", applicable: true, date: "" }] } }));
+ const updateInstallOther = (id, field, value) => setC(prev => ({ ...prev, install: { ...prev.install,
+ otherItems: prev.install.otherItems.map(it => it.id === id ? { ...it, [field]: value } : it) } }));
+ const removeInstallOther = (id) => setC(prev => ({ ...prev, install: { ...prev.install,
+ otherItems: prev.install.otherItems.filter(it => it.id !== id) } }));
+
+ // Extra inverter units (2nd, 3rd...) — kept as Item Directory picks so stock still deducts.
+ const addInverterEntry = () => setC(prev => ({ ...prev, pkg: { ...prev.pkg,
+ inverterEntries: [...(prev.pkg.inverterEntries || []), { id: uid(), model: "", description: "", qty: "1" }] } }));
+ const updateInverterEntry = (id, field, value) => setC(prev => ({ ...prev, pkg: { ...prev.pkg,
+ inverterEntries: (prev.pkg.inverterEntries || []).map(e => e.id === id ? { ...e, [field]: value } : e) } }));
+ const removeInverterEntry = (id) => setC(prev => ({ ...prev, pkg: { ...prev.pkg,
+ inverterEntries: (prev.pkg.inverterEntries || []).filter(e => e.id !== id) } }));
+
+ const [serviceInput, setServiceInput] = useState({ name: "", price: "", qty: "1" });
+ const addServiceEntry = () => {
+ if (!serviceInput.name || !serviceInput.price) return;
+ setC(prev => ({ ...prev, pkg: { ...prev.pkg, serviceEntries: [...(prev.pkg.serviceEntries || []), { id: uid(), ...serviceInput }] } }));
+ setServiceInput({ name: "", price: "", qty: "1" });
+ };
+ const removeServiceEntry = (id) => setC(prev => ({ ...prev, pkg: { ...prev.pkg, serviceEntries: (prev.pkg.serviceEntries || []).filter(e => e.id !== id) } }));
+
+ const [otherInput, setOtherInput] = useState({ name: "", price: "", qty: "1" });
+ const addOtherEntry = () => {
+ if (!otherInput.name || !otherInput.price) return;
+ setC(prev => ({ ...prev, pkg: { ...prev.pkg, otherEntries: [...prev.pkg.otherEntries, { id: uid(), ...otherInput }] } }));
+ setOtherInput({ name: "", price: "", qty: "1" });
+ };
+ const removeOtherEntry = (id) => setC(prev => ({ ...prev, pkg: { ...prev.pkg, otherEntries: prev.pkg.otherEntries.filter(e => e.id !== id) } }));
+
+ const [discountInput, setDiscountInput] = useState({ description: "", amount: "" });
+ const addDiscountEntry = () => {
+ if (!discountInput.amount) return;
+ setC(prev => ({ ...prev, pkg: { ...prev.pkg, discountEntries: [...prev.pkg.discountEntries, { id: uid(), ...discountInput }] } }));
+ setDiscountInput({ description: "", amount: "" });
+ };
+ const removeDiscountEntry = (id) => setC(prev => ({ ...prev, pkg: { ...prev.pkg, discountEntries: prev.pkg.discountEntries.filter(e => e.id !== id) } }));
+
+ const addInsurancePeriod = () => setC(prev => {
+ const periods = prev.insurance.periods;
+ const last = periods[periods.length - 1];
+ const startDate = last && last.endDate ? isoAddDays(last.endDate, 1) : "";
+ const endDate = startDate ? isoAddDays(isoAddYears(startDate, 1), -1) : "";
+ return { ...prev, insurance: { ...prev.insurance, periods: [...periods,
+ { id: uid(), yearLabel: `${periods.length + 1} Year ${periods.length + 1}`, startDate, endDate }] } };
+ });
+ const updateInsurancePeriod = (id, field, value) => setC(prev => ({ ...prev, insurance: { ...prev.insurance,
+ periods: prev.insurance.periods.map(p => p.id === id ? { ...p, [field]: value } : p) } }));
+ const removeInsurancePeriod = (id) => setC(prev => ({ ...prev, insurance: { ...prev.insurance,
+ periods: prev.insurance.periods.filter(p => p.id !== id) } }));
+
+ const addClaimRecord = () => setC(prev => ({ ...prev, insurance: { ...prev.insurance,
+ claimRecords: [...prev.insurance.claimRecords, { id: uid(), date: todayISO(), description: "" }] } }));
+ const updateClaimRecord = (id, field, value) => setC(prev => ({ ...prev, insurance: { ...prev.insurance,
+ claimRecords: prev.insurance.claimRecords.map(r => r.id === id ? { ...r, [field]: value } : r) } }));
+ const removeClaimRecord = (id) => setC(prev => ({ ...prev, insurance: { ...prev.insurance,
+ claimRecords: prev.insurance.claimRecords.filter(r => r.id !== id) } }));
+
+ const price = Number(c.pkg.sellingPrice) || 0;
+ const total = c.payment.records.reduce((s, r) => s + (Number(r.amount) || 0), 0);
+ const balance = price - total;
+ const pct = paymentPercent(c);
+ const stage = stageOf(c);
+ const capacity = (((Number(c.pkg.panelCount) || 0) * (Number(c.pkg.panelSizeW) || 0)) / 1000).toFixed(2);
+ const caseNo = "CASE-" + (c.caseNumber || c.id.slice(0, 6).toUpperCase());
+ const referralLink = typeof window !== "undefined" ? `${window.location.origin}${window.location.pathname}#ref=${c.id}` : "";
+ const copyReferralLink = () => {
+ const fallbackCopy = () => {
+ try {
+ const ta = document.createElement("textarea");
+ ta.value = referralLink;
+ ta.style.position = "fixed";
+ ta.style.opacity = "0";
+ document.body.appendChild(ta);
+ ta.focus();
+ ta.select();
+ const ok = document.execCommand("copy");
+ document.body.removeChild(ta);
+ if (ok) {
+ setLinkCopied("Copied!");
+ setTimeout(() => setLinkCopied(""), 2000);
+ } else {
+ setLinkCopied("Copy failed, please select manually");
+ }
+ } catch {
+ setLinkCopied("Copy failed, please select manually");
+ }
+ };
+ if (navigator.clipboard && navigator.clipboard.writeText) {
+ navigator.clipboard.writeText(referralLink).then(() => {
+ setLinkCopied("Copied!");
+ setTimeout(() => setLinkCopied(""), 2000);
+ }).catch(fallbackCopy);
+ } else {
+ fallbackCopy();
+ }
+ };
+
+ const eppPreview = eppInput.totalAmount ? computeEppEntry(eppInput.totalAmount, eppInput.ratePct) : null;
+ const addEppEntry = () => {
+ if (!eppInput.totalAmount || !eppPreview) return;
+ setC(prev => ({ ...prev, pkg: { ...prev.pkg, eppEntries: [...prev.pkg.eppEntries, {
+ id: uid(), bank: eppInput.bank, months: eppInput.months, ratePct: eppInput.ratePct,
+ totalAmount: eppInput.totalAmount, principal: eppPreview.principal, interest: eppPreview.interest,
+ }] } }));
+ setEppInput({ bank: "", months: "", ratePct: "", totalAmount: "" });
+ };
+ const removeEppEntry = (id) => setC(prev => ({ ...prev, pkg: { ...prev.pkg,
+ eppEntries: prev.pkg.eppEntries.filter(e => e.id !== id) } }));
+
+ // If the package type actually changes (not just on first load), clear out fields that only
+ // belong to a different type — otherwise stale Solar panel/inverter data can silently leak into
+ // a different package type's bill/price. (Battery and EV Charger are separate fields now, so they
+ // can never cross-contaminate each other just by switching package type.)
+ const prevPackageType = useRef(c.pkg.packageType);
+ useEffect(() => {
+ if (prevPackageType.current !== c.pkg.packageType) {
+ const newType = c.pkg.packageType;
+ setC(prev => {
+ const next = structuredClone(prev);
+ if (newType !== "Solar Package") {
+ next.pkg.panelCount = ""; next.pkg.panelModel = ""; next.pkg.panelDescription = ""; next.pkg.panelSizeW = "";
+ next.pkg.inverterModel = ""; next.pkg.inverterDescription = "";
+ // The 22-row hardware checklist is Solar-specific. Clear it for EV/Other so the DO starts
+ // blank — Admin adds only what actually ships via the "Add Item" button below.
+ const untouched = next.delivery.items.every(it => !it.model && !it.qty);
+ if (untouched) next.delivery.items = [];
+ } else {
+ // Switching back to Solar restores the standard checklist, so a case that was briefly set to
+ // another package type doesn't end up with an empty DO. Anything already filled in is kept.
+ const filled = next.delivery.items.filter(it => it.model || it.qty);
+ const presentNames = new Set(filled.map(it => it.name));
+ const restored = DEFAULT_DO_ITEMS
+ .filter(name => !presentNames.has(name))
+ .map(name => ({ id: uid(), name, model: "", qty: "" }));
+ next.delivery.items = [...filled, ...restored];
+ }
+ if (newType === "EV Charger Package") {
+ next.pkg.basePrice = "";
+ }
+ return next;
+ });
+ prevPackageType.current = c.pkg.packageType;
+ }
+ }, [c.pkg.packageType]);
+
+ // Keep c.pkg.sellingPrice in sync automatically — it's derived, not typed in directly.
+ useEffect(() => {
+ const computed = computeSellingPrice(c.pkg);
+ if (String(computed) !== String(c.pkg.sellingPrice)) set("pkg.sellingPrice", String(computed));
+ }, [c.pkg.basePrice, c.pkg.packageType, c.pkg.caseType,
+ c.pkg.battery.price, c.pkg.battery.qty, c.pkg.battery.model,
+ c.pkg.evCharger.price, c.pkg.evCharger.qty, c.pkg.evCharger.model,
+ JSON.stringify(c.pkg.eppEntries),
+ JSON.stringify(c.pkg.discountEntries), JSON.stringify(c.pkg.otherEntries)]);
+
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 860 }}>
+ <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+ <HeaderCard title="GENERAL INFORMATION">
+ <div style={{ background: "#F0F6FB", border: "1px solid #CFE2F0", borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
+ <div style={{ fontSize: 10.5, fontWeight: 700, color: "#2C5F8A", letterSpacing: 0.5 }}>CASE ID</div>
+ <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+ <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 16, fontWeight: 700, color: "#0B2A4A" }}>CASE-</span>
+ <input value={c.caseNumber} onChange={e => set("caseNumber", e.target.value.toUpperCase())}
+ placeholder="Custom No."
+ style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 16, fontWeight: 700, color: "#0B2A4A",
+ border: c.caseNumber ? "none" : "1px solid #C24141", borderRadius: 6,
+ background: c.caseNumber ? "transparent" : "#FBEAEA", outline: "none", flex: 1, minWidth: 80,
+ padding: c.caseNumber ? 0 : "2px 6px", textTransform: "uppercase" }} />
+ </div>
+ </div>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 9, marginBottom: 9 }}>
+ <Field label="Date of Issue">
+ <DateInputDMY value={c.createdAt} onChange={e => set("createdAt", e.target.value)}
+ style={{ padding: "5px 7px", fontSize: 12, ...(!c.createdAt ? { borderColor: "#C24141", background: "#FBEAEA" } : {}) }} />
+ </Field>
+ <Field label="Status">
+ <div style={{ paddingTop: 4 }}><Badge color={stage.color}>{stage.label} - {stage.en}</Badge></div>
+ </Field>
+ <Field label="Package Type">
+ <div style={{ paddingTop: 4, display: "flex", gap: 6, alignItems: "center" }}>
+ <Badge color={PACKAGE_TYPE_COLORS[c.pkg.packageType] || "#0B2A4A"}>{c.pkg.packageType}</Badge>
+ {c.pkg.caseType && c.pkg.caseType !== "New Installation" && c.pkg.packageType === "Solar Package" && <Badge color={CASE_TYPE_COLORS[c.pkg.caseType] || "#9AA2AD"}>{c.pkg.caseType}</Badge>}
+ {isEV(c) && c.pkg.evJobType && <Badge color={EV_JOB_COLORS[c.pkg.evJobType] || "#9AA2AD"}>{c.pkg.evJobType}</Badge>}
+ {c.payment.isLoanCase && <Badge color="#2C5F8A">LOAN</Badge>}
+ {c.payment.installOverride && <Badge color="#C24141">⚡ SPECIAL</Badge>}
+ </div>
+ </Field>
+ {/* Payment standing at a glance — saves opening the Payment tab just to see if it's settled. */}
+ <Field label="Payment Status">
+ <div style={{ paddingTop: 4 }}>
+ <Badge color={pct >= 100 ? "#3C8C63" : pct >= 60 ? "#C89B3C" : pct > 0 ? "#D98C3D" : "#9AA2AD"}>
+ {pct >= 100 ? "FULL PAYMENT" : pct > 0 ? `${pct}% PAID` : "NO PAYMENT"}
+ </Badge>
+ </div>
+ </Field>
+ </div>
+ <Field label="Agent / Internal Assignment">
+ {agentDirectory && agentDirectory.length > 0 ? (
+ <AgentPicker
+ agentDirectory={agentDirectory}
+ agentName={c.agentName}
+ onPick={ag => {
+ if (ag) { set("agentName", ag.name); set("agentCode", ag.code); }
+ else { set("agentName", ""); set("agentCode", ""); }
+ }}
+ />
+ ) : (
+ <div style={{ fontSize: 12, color: "#B5AE9E" }}>No agents registered yet</div>
+ )}
+ </Field>
+
+ {/* Sits with the Agent because it's an internal billing decision, not customer contact info.
+ Highlighted so it's obvious at a glance when paperwork goes out under a different name. */}
+ <div style={{ background: "#F0F6FB", border: "1px solid #CFE2F0", borderRadius: 8, padding: 8, marginTop: 10 }}>
+ <Field label="Billing / Document Name">
+ <TextInput value={c.billingName} onChange={e => set("billingName", e.target.value)}
+ placeholder="Blank = use Full Name" style={{ padding: "5px 7px", fontSize: 12 }} />
+ </Field>
+ <div style={{ fontSize: 10, color: "#6B7686", marginTop: 4 }}>
+ Only fill if different from the SEDA applicant — used on Quotation / Invoice / DO.
+ </div>
+ {c.billingName && c.billingName.trim() && c.billingName.trim() !== (c.customerName || "").trim() && (
+ <div style={{ fontSize: 10.5, color: "#2C5F8A", marginTop: 5, paddingTop: 5, borderTop: "1px solid #CFE2F0" }}>
+ ⚠️ SEDA: <b>{c.customerName || "-"}</b> &nbsp;|&nbsp; Documents: <b>{c.billingName}</b>
+ </div>
+ )}
+ </div>
+ </HeaderCard>
+
+ <HeaderCard title="CUSTOMER PROFILE">
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 9, marginBottom: 9 }}>
+ <Field label="Full Name (SEDA Applicant)">
+ <TextInput value={c.customerName} onChange={e => set("customerName", e.target.value)} placeholder="Customer name (SEDA applicant)"
+ style={{ padding: "5px 7px", fontSize: 12, ...(!c.customerName ? { borderColor: "#C24141", background: "#FBEAEA" } : {}) }} />
+ </Field>
+ {/* Mirrored from Package Details so the customer's property type is visible while keying in
+ their details, without having to switch tabs. Read-only here — edit it in Package Details. */}
+ <Field label="Property Type (from Package Details)">
+ <div style={{ padding: "5px 7px", fontSize: 12, border: "1px solid #F0ECE1", borderRadius: 8,
+ background: "#FBFAF6", color: "#6B7686" }}>
+ {c.pkg.propertyType || "-"}
+ </div>
+ </Field>
+ <Field label="IC / Passport No.">
+ <TextInput value={c.ic} onChange={e => set("ic", e.target.value)} placeholder="IC No. or Passport No." style={{ padding: "5px 7px", fontSize: 12 }} />
+ </Field>
+ <Field label="Email">
+ <TextInput value={c.customerEmail} onChange={e => set("customerEmail", e.target.value)} placeholder="customer@email.com" style={{ padding: "5px 7px", fontSize: 12 }} />
+ </Field>
+ <Field label="Contact">
+ <TextInput value={c.customerPhone} onChange={e => set("customerPhone", e.target.value)} placeholder="012-3456789" style={{ padding: "5px 7px", fontSize: 12 }} />
+ </Field>
+ <Field label="TIN Number">
+ <TextInput value={c.tin} onChange={e => set("tin", e.target.value)} placeholder="Customer TIN Number" style={{ padding: "5px 7px", fontSize: 12 }} />
+ </Field>
+ </div>
+ <Field label="Installation Address">
+ <TextArea value={c.installAddress} onChange={e => set("installAddress", e.target.value)} placeholder="Full installation address" style={{ padding: "5px 7px", fontSize: 12, minHeight: 48 }} />
+ </Field>
+ </HeaderCard>
+ </div>
+
+ <DeptTabBar active={tab} onChange={setTab} packageType={c.pkg.packageType} caseType={c.pkg.caseType} />
+
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 18, display: "flex", flexDirection: "column", gap: 14 }}>
+
+ {tab === "package" && (
+ <>
+ <div style={{ background: PACKAGE_TYPE_COLORS[c.pkg.packageType] || "#0B2A4A", borderRadius: 10, padding: "10px 14px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+ <span style={{ color: "#fff", fontWeight: 700, fontSize: 14 }}>{PACKAGE_TYPE_LABELS[c.pkg.packageType] || c.pkg.packageType}</span>
+ <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+ {c.pkg.packageType === "Solar Package" && (
+ <select value={c.pkg.caseType} onChange={e => set("pkg.caseType", e.target.value)}
+ style={{ ...inputStyle, width: 170, background: "#fff", padding: "5px 7px", fontSize: 12 }}>
+ {CASE_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+ </select>
+ )}
+ {c.pkg.packageType === "EV Charger Package" && (
+ <select value={c.pkg.evJobType} onChange={e => set("pkg.evJobType", e.target.value)}
+ style={{ ...inputStyle, width: 170, background: "#fff", padding: "5px 7px", fontSize: 12 }}>
+ {EV_JOB_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+ </select>
+ )}
+ <select value={c.pkg.packageType} onChange={e => set("pkg.packageType", e.target.value)}
+ style={{ ...inputStyle, width: 180, background: "#fff", padding: "5px 7px", fontSize: 12 }}>
+ {PACKAGE_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+ </select>
+ </div>
+ </div>
+ {isEV(c) && (
+ <div style={{ background: "#FBF8F0", border: "1px solid #E3D8B8", borderRadius: 8, padding: "7px 12px", fontSize: 11.5, color: "#8A6414" }}>
+ {c.pkg.evJobType === "Combo Set" && "Combo Set — we supply the wallbox and install it. Goods go on the DO and stock is deducted on install."}
+ {c.pkg.evJobType === "Wallbox Only" && "Wallbox Only — we supply the unit, customer arranges their own installer. Goods go on the DO and stock is deducted, but this case will NOT appear in the Install Queue."}
+ {c.pkg.evJobType === "Installation Only" && `Installation Only — customer supplies their own wallbox, we only do the wiring (${c.pkg.phaseType || "phase not set"}). No goods on the DO and no stock deducted.`}
+ </div>
+ )}
+ {c.pkg.packageType === "Solar Package" && c.pkg.caseType === "Top Up" && (
+ <div style={{ background: "#FBF8F0", border: "1px solid #E3D8B8", borderRadius: 8, padding: "7px 12px", fontSize: 11.5, color: "#8A6414" }}>
+ Top Up — adds panels/inverters to an existing system. SEDA and TNB tabs are hidden since the
+ system is already registered; the DO checklist and stock tracking work as normal.
+ </div>
+ )}
+
+
+ {/* Package spec entry (Property Type through Discount + Note). Admins mostly only need to read
+ the DESCRIPTION below, so this whole block collapses once the case has been saved — a new
+ case opens expanded so the details can be keyed in first. */}
+ <div style={{ border: "1px solid #E9E4D8", borderRadius: 10, overflow: "hidden" }}>
+ <button type="button" onClick={() => setSpecsOpen(v => !v)}
+ style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
+ padding: "10px 14px", background: specsOpen ? "#FBFAF6" : "#fff", border: "none",
+ borderBottom: specsOpen ? "1px solid #F0ECE1" : "none", cursor: "pointer", textAlign: "left" }}>
+ <span style={{ fontSize: 11.5, fontWeight: 700, color: "#6B7686", letterSpacing: 0.4 }}>
+ PACKAGE SPECS &amp; PRICING {!specsOpen && <span style={{ color: "#9AA2AD", fontWeight: 500 }}>— click to edit</span>}
+ </span>
+ {specsOpen ? <ChevronDown size={16} color="#9AA2AD" /> : <ChevronRight size={16} color="#9AA2AD" />}
+ </button>
+ {specsOpen && (
+ <div style={{ padding: 14, display: "flex", flexDirection: "column", gap: 12 }}>
+
+ {/* Row 1: Property Type, Phase Type, System Type, Region */}
+ <div style={{ display: "grid", gridTemplateColumns: c.pkg.packageType === "Solar Package" ? "repeat(5, 1fr)" : "repeat(4, 1fr)", gap: 12 }}>
+ <Field label="Property Type">
+ <Select value={c.pkg.propertyType} onChange={e => set("pkg.propertyType", e.target.value)}
+ options={PROPERTY_TYPES.map(p => p.v)} />
+ </Field>
+ <Field label="Phase Type">
+ <Select value={c.pkg.phaseType} onChange={e => set("pkg.phaseType", e.target.value)} options={PHASE_TYPES} />
+ </Field>
+ {c.pkg.packageType === "Solar Package" && (
+ <Field label="System Type">
+ <Select value={c.pkg.systemType} onChange={e => set("pkg.systemType", e.target.value)} options={SYSTEM_TYPES} />
+ </Field>
+ )}
+ <Field label="Region (State)">
+ <Select value={c.pkg.region} onChange={e => set("pkg.region", e.target.value)}
+ options={[{ value: "", label: "Not Set" }, ...MALAYSIA_STATES]} />
+ </Field>
+ <Field label="District / Area">
+ <TextInput value={c.pkg.district} onChange={e => set("pkg.district", e.target.value)} placeholder="e.g. JB, PONTIAN, KULAI" />
+ </Field>
+ </div>
+
+ {/* Row 2: Panel Size, Panel Count, Inverter Model */}
+ {c.pkg.packageType === "Solar Package" && (
+ <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12 }}>
+ <Field label="Panel Size (W)">
+ <ItemPicker category="Panel" itemDirectory={itemDirectory} model={c.pkg.panelModel}
+ onModelChange={v => set("pkg.panelModel", v)} onDescriptionChange={v => set("pkg.panelDescription", v)}
+ onWattChange={v => set("pkg.panelSizeW", v)} />
+ </Field>
+ <Field label="Panel Count">
+ <NumberInput value={c.pkg.panelCount} onChange={e => set("pkg.panelCount", e.target.value)} placeholder="0" />
+ {c.pkg.panelSizeW && (
+ <div style={{ fontSize: 11.5, color: "#6B7686", marginTop: 4 }}>
+ {c.pkg.panelSizeW}W × {c.pkg.panelCount || 0} = {(((Number(c.pkg.panelCount)||0) * (Number(c.pkg.panelSizeW)||0))/1000).toFixed(2)}kWp
+ </div>
+ )}
+ </Field>
+ <Field label="Inverter Model">
+ <ItemPicker category="Inverter" itemDirectory={itemDirectory} model={c.pkg.inverterModel}
+ onModelChange={v => set("pkg.inverterModel", v)} onDescriptionChange={v => set("pkg.inverterDescription", v)} />
+ </Field>
+ </div>
+ )}
+
+ {/* Additional inverter units — a job occasionally needs 2-3, usually of different models.
+ These are tracked as real Item Directory picks so stock deducts properly on install. */}
+ {c.pkg.packageType === "Solar Package" && (
+ <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+ {(c.pkg.inverterEntries || []).map((e, i) => (
+ <div key={e.id} style={{ display: "grid", gridTemplateColumns: "1fr 90px auto", gap: 10, alignItems: "end" }}>
+ <Field label={`Additional Inverter #${i + 2}`}>
+ <ItemPicker category="Inverter" itemDirectory={itemDirectory} model={e.model}
+ onModelChange={v => updateInverterEntry(e.id, "model", v)}
+ onDescriptionChange={v => updateInverterEntry(e.id, "description", v)} />
+ </Field>
+ <Field label="Qty">
+ <NumberInput value={e.qty} onChange={ev => updateInverterEntry(e.id, "qty", ev.target.value)} placeholder="1" />
+ </Field>
+ <button onClick={() => removeInverterEntry(e.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "#C24141", paddingBottom: 8 }}>
+ <Trash2 size={15} />
+ </button>
+ </div>
+ ))}
+ <button onClick={addInverterEntry} style={{ ...btnGhost, alignSelf: "flex-start" }}>
+ <Plus size={13}/> Add Another Inverter
+ </button>
+ </div>
+ )}
+
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, alignItems: "end" }}>
+ {c.pkg.packageType !== "EV Charger Package" ? (
+ <Field label="Base Package Price (RM)">
+ <NumberInput value={c.pkg.basePrice} onChange={e => set("pkg.basePrice", e.target.value)} placeholder="Panel + Inverter + Installation"
+ style={{ background: "#FFF6DA", borderColor: "#C89B3C", fontWeight: 700, color: "#8A6414" }} />
+ </Field>
+ ) : <div />}
+ <div style={{ background: "#F0F6FB", border: "1px solid #CFE2F0", borderRadius: 8, padding: "8px 14px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+ <span style={{ fontSize: 12, color: "#2C5F8A", fontWeight: 600 }}>Selling Price (Auto)</span>
+ <span style={{ fontSize: 18, fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace", color: "#0B2A4A" }}>{fmtMoney(price)}</span>
+ </div>
+ </div>
+
+ {c.pkg.packageType !== "Other Package" && (
+ <>
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5, marginTop: 4 }}>
+ {c.pkg.packageType === "EV Charger Package" ? "EV Charger" : "Battery"}
+ </div>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+ {c.pkg.packageType === "EV Charger Package" ? (
+ <>
+ <Field label="EV Charger">
+ <ItemPicker category="EV Charger" itemDirectory={itemDirectory} model={c.pkg.evCharger.model}
+ onModelChange={v => set("pkg.evCharger.model", v)} onDescriptionChange={v => set("pkg.evCharger.description", v)} />
+ </Field>
+ <Field label="Price (RM)"><NumberInput value={c.pkg.evCharger.price} onChange={e => set("pkg.evCharger.price", e.target.value)} placeholder="0" /></Field>
+ <Field label="Qty"><NumberInput value={c.pkg.evCharger.qty} onChange={e => set("pkg.evCharger.qty", e.target.value)} placeholder="0" /></Field>
+ </>
+ ) : (
+ <>
+ <Field label="Battery">
+ <ItemPicker category="Battery" itemDirectory={itemDirectory} model={c.pkg.battery.model}
+ onModelChange={v => set("pkg.battery.model", v)} onDescriptionChange={v => set("pkg.battery.description", v)} />
+ </Field>
+ <Field label="Price (RM)"><NumberInput value={c.pkg.battery.price} onChange={e => set("pkg.battery.price", e.target.value)} placeholder="0" /></Field>
+ <Field label="Qty"><NumberInput value={c.pkg.battery.qty} onChange={e => set("pkg.battery.qty", e.target.value)} placeholder="0" /></Field>
+ </>
+ )}
+ </div>
+ </>
+ )}
+
+ <div style={{ background: "#FBF8F0", border: "1px dashed #E3D8B8", borderRadius: 8, padding: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+ <span style={{ fontSize: 12, fontWeight: 700, color: "#B08A2E" }}>Other Items (Goods — ships with DO)</span>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 110px 70px auto", gap: 7 }}>
+ <TextInput value={otherInput.name} onChange={e => setOtherInput(prev => ({ ...prev, name: e.target.value }))} placeholder="Item Name / Description" style={{ padding: "5px 7px", fontSize: 12 }} />
+ <NumberInput value={otherInput.price} onChange={e => setOtherInput(prev => ({ ...prev, price: e.target.value }))} placeholder="Price (RM)" style={{ padding: "5px 7px", fontSize: 12 }} />
+ <NumberInput value={otherInput.qty} onChange={e => setOtherInput(prev => ({ ...prev, qty: e.target.value }))} placeholder="Qty" style={{ padding: "5px 7px", fontSize: 12 }} />
+ <button onClick={addOtherEntry} disabled={!otherInput.name || !otherInput.price} style={{ ...btnPrimary, padding: "5px 10px", fontSize: 11.5, opacity: (!otherInput.name || !otherInput.price) ? 0.45 : 1 }}>
+ <Plus size={12}/> ADD
+ </button>
+ </div>
+ {c.pkg.otherEntries.length > 0 && (
+ <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+ {c.pkg.otherEntries.map(e => (
+ <div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, background: "#fff", borderRadius: 6, padding: "5px 9px" }}>
+ <span>{e.name} × {e.qty || 1} — {fmtMoney((Number(e.price)||0) * (Number(e.qty)||1))}</span>
+ <button onClick={() => removeOtherEntry(e.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "#C24141" }}><Trash2 size={13} /></button>
+ </div>
+ ))}
+ </div>
+ )}
+ </div>
+
+ {/* Charge-only lines: they add to the package price and show on the quotation, but never
+ appear on the DO and never touch stock — for service fees, extra labour, etc. */}
+ <div style={{ background: "#F0F6FB", border: "1px dashed #CFE2F0", borderRadius: 8, padding: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+ <span style={{ fontSize: 12, fontWeight: 700, color: "#2C5F8A" }}>Service / Extra Charges (No goods — not in DO)</span>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 110px 70px auto", gap: 7 }}>
+ <TextInput value={serviceInput.name} onChange={e => setServiceInput(prev => ({ ...prev, name: e.target.value }))} placeholder="e.g. Extra Wiring Labour" style={{ padding: "5px 7px", fontSize: 12 }} />
+ <NumberInput value={serviceInput.price} onChange={e => setServiceInput(prev => ({ ...prev, price: e.target.value }))} placeholder="Price (RM)" style={{ padding: "5px 7px", fontSize: 12 }} />
+ <NumberInput value={serviceInput.qty} onChange={e => setServiceInput(prev => ({ ...prev, qty: e.target.value }))} placeholder="Qty" style={{ padding: "5px 7px", fontSize: 12 }} />
+ <button onClick={addServiceEntry} disabled={!serviceInput.name || !serviceInput.price} style={{ ...btnPrimary, padding: "5px 10px", fontSize: 11.5, opacity: (!serviceInput.name || !serviceInput.price) ? 0.45 : 1 }}>
+ <Plus size={12}/> ADD
+ </button>
+ </div>
+ {(c.pkg.serviceEntries || []).length > 0 && (
+ <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+ {(c.pkg.serviceEntries || []).map(e => (
+ <div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, background: "#fff", borderRadius: 6, padding: "5px 9px" }}>
+ <span>{e.name} × {e.qty || 1} — {fmtMoney((Number(e.price)||0) * (Number(e.qty)||1))}</span>
+ <button onClick={() => removeServiceEntry(e.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "#C24141" }}><Trash2 size={13} /></button>
+ </div>
+ ))}
+ </div>
+ )}
+ </div>
+
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5, marginTop: 4 }}>Pricing</div>
+
+ <div style={{ background: "#FBF8F0", border: "1px dashed #E3D8B8", borderRadius: 8, padding: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+ <span style={{ fontSize: 12, fontWeight: 700, color: "#B08A2E" }}>EPP Interest</span>
+ 
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 7 }}>
+ {/* Total Received comes first because that's the figure Admin has in hand from the bank
+ statement — bank/months/rate are looked up after, so keying flows left to right. */}
+ <Field label="Total Received (RM)">
+ <NumberInput value={eppInput.totalAmount} onChange={e => setEppInput(prev => ({ ...prev, totalAmount: e.target.value }))}
+ placeholder="Total with interest"
+ style={{ padding: "5px 7px", fontSize: 12, background: "#FFF6DA", borderColor: "#C89B3C", fontWeight: 700, color: "#8A6414" }} />
+ </Field>
+ <Field label="Bank">
+ <Select value={eppInput.bank} onChange={e => {
+ const bank = e.target.value;
+ const months = Number(eppInput.months);
+ const preset = EPP_RATE_TABLE[bank] && EPP_RATE_TABLE[bank][months];
+ setEppInput(prev => ({ ...prev, bank, ratePct: preset ? String(preset) : prev.ratePct }));
+ }} options={["", ...EPP_BANKS]} />
+ </Field>
+ <Field label="Months">
+ <Select value={eppInput.months} onChange={e => {
+ const months = e.target.value;
+ const preset = EPP_RATE_TABLE[eppInput.bank] && EPP_RATE_TABLE[eppInput.bank][Number(months)];
+ setEppInput(prev => ({ ...prev, months, ratePct: preset ? String(preset) : prev.ratePct }));
+ }} options={["", ...EPP_MONTHS.map(String)]} />
+ </Field>
+ <Field label="Rate (%)">
+ <NumberInput value={eppInput.ratePct} onChange={e => setEppInput(prev => ({ ...prev, ratePct: e.target.value }))} placeholder="Manual entry if no preset" style={{ padding: "5px 7px", fontSize: 12 }} />
+ </Field>
+ </div>
+ {eppPreview && (
+ <div style={{ fontSize: 12.5, color: "#6B7686" }}>
+ Principal: <b>{fmtMoney2(eppPreview.principal)}</b> &nbsp;+&nbsp; Interest: <b style={{ color: "#B08A2E" }}>{fmtMoney2(eppPreview.interest)}</b> &nbsp;=&nbsp; {fmtMoney2(eppInput.totalAmount)}
+ </div>
+ )}
+ <button onClick={addEppEntry} disabled={!eppPreview} style={{ ...btnPrimary, alignSelf: "flex-start", padding: "5px 10px", fontSize: 11.5, opacity: eppPreview ? 1 : 0.45 }}>
+ <Plus size={13}/> ADD IN PACKAGE
+ </button>
+
+ {c.pkg.eppEntries.length > 0 && (
+ <div style={{ display: "flex", flexDirection: "column", gap: 6, borderTop: "1px solid #E3D8B8", paddingTop: 10 }}>
+ {c.pkg.eppEntries.map((e, i) => (
+ <div key={e.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 12, background: "#fff", borderRadius: 6, padding: "5px 9px" }}>
+ <span>#{i + 1} {e.bank} {e.months} @ {e.ratePct}% — {fmtMoney2(e.principal)} + <b style={{ color: "#B08A2E" }}>{fmtMoney2(e.interest)}</b></span>
+ <button onClick={() => removeEppEntry(e.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "#C24141" }}>
+ <Trash2 size={13} />
+ </button>
+ </div>
+ ))}
+ <div style={{ fontSize: 12, color: "#6B7686" }}>Total EPP Interest: <b>{fmtMoney2(c.pkg.eppEntries.reduce((s, e) => s + (Number(e.interest) || 0), 0))}</b></div>
+ </div>
+ )}
+ </div>
+ <div style={{ background: "#FBF0F0", border: "1px dashed #E8C6C6", borderRadius: 8, padding: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+ <span style={{ fontSize: 12, fontWeight: 700, color: "#C24141" }}>Discount</span>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 150px auto", gap: 7 }}>
+ <TextInput value={discountInput.description} onChange={e => setDiscountInput(prev => ({ ...prev, description: e.target.value }))} placeholder="Discount reason, e.g. FOC Extra Cable" style={{ padding: "5px 7px", fontSize: 12 }} />
+ <NumberInput value={discountInput.amount} onChange={e => setDiscountInput(prev => ({ ...prev, amount: e.target.value }))} placeholder="Amount (RM)" style={{ padding: "5px 7px", fontSize: 12 }} />
+ <button onClick={addDiscountEntry} disabled={!discountInput.amount} style={{ ...btnPrimary, background: "#C24141", padding: "5px 10px", fontSize: 11.5, opacity: !discountInput.amount ? 0.45 : 1 }}>
+ <Plus size={13}/> ADD
+ </button>
+ </div>
+ {c.pkg.discountEntries.length > 0 && (
+ <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+ {c.pkg.discountEntries.map(e => (
+ <div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, background: "#fff", borderRadius: 6, padding: "5px 9px" }}>
+ <span>{e.description || "Discount"}</span>
+ <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+ <b style={{ color: "#C24141" }}>-{fmtMoney(e.amount)}</b>
+ <button onClick={() => removeDiscountEntry(e.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "#C24141" }}><Trash2 size={13} /></button>
+ </span>
+ </div>
+ ))}
+ <div style={{ fontSize: 12, color: "#6B7686"}}>Total Discount: <b style={{ color:"#C24141" }}>-{fmtMoney(c.pkg.discountEntries.reduce((s,e)=>s+(Number(e.amount)||0),0))}</b></div>
+ </div>
+ )}
+ </div>
+
+ <Field label="Note">
+ <TextArea value={c.pkg.note} onChange={e => set("pkg.note", e.target.value)} placeholder="Other package details" />
+ </Field>
+
+ </div>
+ )}
+ </div>
+
+
+ <div>
+ <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+ <span style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5 }}>BILLING DETAILS PREVIEW</span>
+ <Badge color="#0B2A4A">PACKAGE</Badge>
+ </div>
+ <div style={{ border: "1px solid #E9E4D8", borderRadius: 10, overflow: "hidden" }}>
+ <table style={{ width: "100%", borderCollapse: "collapse" }}>
+ <thead>
+ <tr style={{ background: "#FBFAF6" }}>
+ <th style={{ ...thStyle, width: "50%" }}>DESCRIPTION</th>
+ <th style={thStyle}>QTY</th>
+ <th style={thStyle}>UNIT RATE</th>
+ <th style={thStyle}>AMOUNT</th>
+ </tr>
+ </thead>
+ <tbody>
+ {buildBillingLines(c).lines.map((l, i) => (
+ <tr key={i}>
+ <td style={{ ...tdStyle, fontSize: 12, lineHeight: 1.7, whiteSpace: "pre-line", verticalAlign: "top", color: l.isDiscount ? "#C24141" : "#1B2430" }}>{l.desc}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace", verticalAlign: "top" }}>{l.qty}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace", verticalAlign: "top" }}>{fmtMoney(l.rate)}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 700, verticalAlign: "top", color: l.isDiscount ? "#C24141" : "#1B2430" }}>{fmtMoney(l.amt)}</td>
+ </tr>
+ ))}
+ <tr>
+ <td colSpan={3} style={{ ...tdStyle, textAlign: "right", fontWeight: 700 }}>TOTAL AMOUNT (RM)</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 700 }}>{fmtMoney(price)}</td>
+ </tr>
+ </tbody>
+ </table>
+ </div>
+ <div style={{ fontSize: 11, color: "#B5AE9E", marginTop: 6 }}> Agent / PDF</div>
+ </div>
+ <AdminNote value={c.pkg.note2 || ""} onChange={e => set("pkg.note2", e.target.value)} />
+ </>
+ )}
+
+ {tab === "payment" && (
+ <>
+ <div style={{ display: "flex", gap: 16, fontSize: 13, fontFamily: "'IBM Plex Mono', monospace" }}>
+ <span> Price: <b>{fmtMoney(price)}</b></span>
+ <span style={{ color: "#3C8C63" }}> Collected: <b>{fmtMoney(total)}</b></span>
+ <span style={{ color: balance > 0 ? "#C24141" : "#3C8C63" }}> Balance: <b>{fmtMoney(balance)}</b></span>
+ </div>
+
+ <div style={{ background: "#F0F6FB", border: "1px solid #CFE2F0", borderRadius: 8, padding: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+ <label style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12, fontWeight: 600, color: "#2C5F8A", cursor: "pointer" }}>
+ <input type="checkbox" checked={c.payment.isLoanCase} onChange={e => set("payment.isLoanCase", e.target.checked)} />
+ Loan Case — customer pays deposit, balance comes from the bank
+ </label>
+ {c.payment.isLoanCase && (
+ <div style={{ display: "grid", gridTemplateColumns: "150px 120px 1fr 120px", gap: 7 }}>
+ <Field label="Loan Bank">
+ <TextInput value={c.payment.loanBank} onChange={e => set("payment.loanBank", e.target.value)} placeholder="Maybank / CIMB" style={{ padding: "5px 7px", fontSize: 12 }} />
+ </Field>
+ <Field label="Approved Amount">
+ <NumberInput value={c.payment.loanApprovedAmount} onChange={e => set("payment.loanApprovedAmount", e.target.value)} placeholder="RM" style={{ padding: "5px 7px", fontSize: 12 }} />
+ </Field>
+ <Field label="Ref Number">
+ <TextInput value={c.payment.loanRefNo} onChange={e => set("payment.loanRefNo", e.target.value)} placeholder="Bank ref number" style={{ padding: "5px 7px", fontSize: 12 }} />
+ </Field>
+ <Field label="LO Received">
+ <DateInputDMY value={c.payment.loReceivedDate} onChange={e => set("payment.loReceivedDate", e.target.value)} style={{ padding: "5px 7px", fontSize: 12 }} />
+ </Field>
+ </div>
+ )}
+ </div>
+
+ {/* Lets a case join the Install Queue before the usual 60%. Because it overrides a payment
+ control, the approver and reason are captured here so the decision is traceable later. */}
+ <div style={{ background: c.payment.installOverride ? "#FBEAEA" : "#FBFAF6",
+ border: `1px solid ${c.payment.installOverride ? "#E3A9A9" : "#F0ECE1"}`,
+ borderRadius: 8, padding: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+ <label style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12, fontWeight: 600,
+ color: c.payment.installOverride ? "#8B3A3A" : "#6B7686", cursor: "pointer" }}>
+ <input type="checkbox" checked={c.payment.installOverride} onChange={e => set("payment.installOverride", e.target.checked)} />
+ ⚡ Special Approval — allow install queue before 60% paid
+ </label>
+ {c.payment.installOverride && (
+ <>
+ <div style={{ display: "grid", gridTemplateColumns: "150px 120px 1fr", gap: 7 }}>
+ <Field label="Approved By">
+ <TextInput value={c.payment.overrideApprovedBy} onChange={e => set("payment.overrideApprovedBy", e.target.value)}
+ placeholder="Name"
+ style={{ padding: "5px 7px", fontSize: 12, ...(!c.payment.overrideApprovedBy ? { borderColor: "#C24141", background: "#FBEAEA" } : {}) }} />
+ </Field>
+ <Field label="Approval Date">
+ <DateInputDMY value={c.payment.overrideDate} onChange={e => set("payment.overrideDate", e.target.value)} style={{ padding: "5px 7px", fontSize: 12 }} />
+ </Field>
+ <Field label="Reason">
+ <TextInput value={c.payment.overrideReason} onChange={e => set("payment.overrideReason", e.target.value)} placeholder="Why queued early" style={{ padding: "5px 7px", fontSize: 12 }} />
+ </Field>
+ </div>
+ <div style={{ fontSize: 10.5, color: "#8B3A3A" }}>
+ Will appear in the Install Queue flagged SPECIAL APPROVAL — currently {pct}% paid.
+ </div>
+ </>
+ )}
+ </div>
+
+ {/* One payment per row, with a column header so it reads like a ledger instead of a stack
+ of loose boxes. Horizontally scrollable on narrow screens rather than wrapping. */}
+ <div style={{ overflowX: "auto" }}>
+ <div style={{ minWidth: 900, display: "flex", flexDirection: "column", gap: 4 }}>
+ <div style={{ display: "grid", gridTemplateColumns: "22px 120px 100px 95px 110px 120px 1fr 28px", gap: 6,
+ fontSize: 10, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.3, padding: "0 2px 2px" }}>
+ <span>#</span><span>DATE</span><span>AMOUNT</span><span>BANK</span><span>MODE</span><span>VERIFIED</span><span>NOTE</span><span /><span />
+ </div>
+ {c.payment.records.map((r, i) => (
+ <div key={r.id} style={{ display: "grid", gridTemplateColumns: "22px 120px 100px 95px 110px 120px 1fr 28px 28px", gap: 6,
+ alignItems: "center", background: i % 2 ? "#FBFAF6" : "transparent", borderRadius: 6, padding: "3px 2px" }}>
+ <span style={{ fontSize: 11, color: "#9AA2AD" }}>{i + 1}</span>
+ <DateInputDMY value={r.date} onChange={e => updatePayment(r.id, "date", e.target.value)}
+ style={{ padding: "5px 6px", fontSize: 11.5, ...(!r.date && Number(r.amount) > 0 ? { borderColor: "#C24141", background: "#FBEAEA" } : {}) }} />
+ <NumberInput value={r.amount} onChange={e => updatePayment(r.id, "amount", e.target.value)} placeholder="Amount" style={{ padding: "5px 6px", fontSize: 11.5 }} />
+ <Select value={r.bank} onChange={e => updatePayment(r.id, "bank", e.target.value)}
+ options={[{ value: "", label: "—" }, ...BANK_OPTIONS]} style={{ padding: "5px 6px", fontSize: 11.5 }} />
+ <Select value={r.paymentMode} onChange={e => updatePayment(r.id, "paymentMode", e.target.value)}
+ options={[{ value: "", label: "—" }, ...PAYMENT_MODE_OPTIONS]} style={{ padding: "5px 6px", fontSize: 11.5 }} />
+ <DateInputDMY value={r.verifiedDate || ""} onChange={e => updatePayment(r.id, "verifiedDate", e.target.value)}
+ style={{ padding: "5px 6px", fontSize: 11.5, ...(r.verifiedDate ? { borderColor: "#3C8C63", background: "#EAF5EE" } : {}) }} />
+ <TextInput value={r.note} onChange={e => updatePayment(r.id, "note", e.target.value)} placeholder="Deposit / Balance…" style={{ padding: "5px 6px", fontSize: 11.5 }} />
+ <button onClick={() => removePayment(r.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "#C24141", padding: 0 }}>
+ <Trash2 size={14} />
+ </button>
+ {r.verifiedDate ? (
+ <button onClick={() => openWhatsApp(agentPhoneFor(c, agentDirectory), buildPaymentWhatsAppText(c, r, i))}
+ title="Notify Agent this payment is verified"
+ style={{ border: "none", background: "none", cursor: "pointer", color: "#3C8C63", padding: 0 }}>
+ 💬
+ </button>
+ ) : <span />}
+ </div>
+ ))}
+ </div>
+ </div>
+ <button onClick={addPayment} style={{ ...btnGhost, alignSelf: "flex-start" }}><Plus size={13}/> Add Payment Record</button>
+ <AdminNote value={c.payment.note} onChange={e => set("payment.note", e.target.value)} />
+ </>
+ )}
+
+ {tab === "seda" && (
+ <>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+ <Field label="Submit Date">
+ <DateInputDMY value={c.seda.submitDate} onChange={e => set("seda.submitDate", e.target.value)} />
+ </Field>
+ <Field label="Approval Date">
+ <DateInputDMY value={c.seda.approvalDate} onChange={e => set("seda.approvalDate", e.target.value)} />
+ </Field>
+ <Field label="Certification No.">
+ <TextInput value={c.seda.certificationNo} onChange={e => set("seda.certificationNo", e.target.value)} placeholder="Certification No." />
+ </Field>
+ <Field label="EOT Date">
+ <DateInputDMY value={c.seda.eotDate} onChange={e => set("seda.eotDate", e.target.value)} />
+ </Field>
+ <Field label="Milestone Date">
+ <DateInputDMY value={c.seda.milestoneDate} onChange={e => set("seda.milestoneDate", e.target.value)}
+ style={installComplete(c) && !c.seda.milestoneDate ? { borderColor: "#C24141", background: "#FBEAEA" } : undefined} />
+ </Field>
+ </div>
+ {installComplete(c) && !c.seda.milestoneDate && (
+ <div style={{ background: "#FBEAEA", border: "1px solid #E3A9A9", borderRadius: 8, padding: "7px 12px", fontSize: 11.5, color: "#8B3A3A" }}>
+ Installation is done but the SEDA milestone hasn't been updated yet — this case is showing on the Pending Update Milestone report.
+ </div>
+ )}
+ {/* Only the button matching the case's actual current status is shown — once Approval Date is
+ filled in, "Submitted" disappears so it can't be sent by mistake after approval. */}
+ {c.seda.approvalDate ? (
+ <WhatsAppNotifyBlock label="SEDA" agentPhone={agentPhoneFor(c, agentDirectory)}
+ stages={[{ key: "approved", label: "Approved", text: buildSedaWhatsAppText(c, "approved") }]} />
+ ) : c.seda.submitDate ? (
+ <WhatsAppNotifyBlock label="SEDA" agentPhone={agentPhoneFor(c, agentDirectory)}
+ stages={[{ key: "submitted", label: "Submitted", text: buildSedaWhatsAppText(c, "submitted") }]} />
+ ) : (
+ <div style={{ fontSize: 11, color: "#B5AE9E" }}>Fill in Submit Date to enable the WhatsApp notification.</div>
+ )}
+ <AdminNote value={c.seda.note} onChange={e => set("seda.note", e.target.value)} />
+ </>
+ )}
+
+ {tab === "install" && (
+ <>
+ {c.payment.isLoanCase && !c.payment.loReceivedDate && (
+ <div style={{ background: "#FBEAEA", border: "1px solid #E3A9A9", borderRadius: 10, padding: "10px 14px", display: "flex", alignItems: "center", gap: 8 }}>
+ <span style={{ fontSize: 18 }}>⚠️</span>
+ <div style={{ fontSize: 12.5, color: "#8B3A3A", fontWeight: 600, lineHeight: 1.5 }}>
+ Case LO(Letter of Offer)——tab LO <br/>
+ Loan case — LO not received yet. Installation should not be scheduled until the bank's Letter of Offer is confirmed.
+ </div>
+ </div>
+ )}
+ {/* Printed on the DO as "Installation Date" — it tells the customer when to expect the crew.
+ Purely informational: stock is deducted by each component's own install date, not this. */}
+ <div style={{ display: "grid", gridTemplateColumns: "180px 170px 130px", gap: 10 }}>
+ <Field label="Installation Date">
+ <DateInputDMY value={c.install.deliveryDate} onChange={e => set("install.deliveryDate", e.target.value)} />
+ </Field>
+ <Field label="Time Slot">
+ <Select value={c.delivery.installTimeSlot} onChange={e => set("delivery.installTimeSlot", e.target.value)}
+ options={[{ value: "", label: "Not Set" }, "Morning (AM)", "Afternoon (PM)", "Full Day"]} />
+ </Field>
+ <Field label="Time">
+ <TextInput value={c.delivery.installTime} onChange={e => set("delivery.installTime", e.target.value)} placeholder="10.00am" />
+ </Field>
+ </div>
+
+ <div style={{ fontSize: 11, color: "#9AA2AD" }}>
+ Tick what this job needs, then fill the date once it's installed. Each component can have its own crew — they're often done by different teams on different days.
+ </div>
+
+ {/* One component per row with column headers, matching the Payment ledger layout.
+ Model/Qty only apply to Battery/EV/Cap Bank, so those cells stay blank for the rest. */}
+ <div style={{ overflowX: "auto" }}>
+ <div style={{ minWidth: 940, display: "flex", flexDirection: "column", gap: 3 }}>
+ <div style={{ display: "grid", gridTemplateColumns: "22px 105px 118px 150px 60px 1fr 1fr 1fr", gap: 6,
+ fontSize: 10, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.3, padding: "0 2px 2px" }}>
+ <span /><span>COMPONENT</span><span>INSTALL DATE</span><span>MODEL</span><span>QTY</span>
+ <span>SITE SUPERVISOR</span><span>INSTALLER</span><span>WIRING TEAM</span>
+ </div>
+ {installComponentsForPackageType(c.pkg.packageType).map(([k, label], idx) => {
+ const on = c.install[k].applicable;
+ const hasModel = k === "battery" || k === "ev" || k === "capBank";
+ return (
+ <div key={k} style={{ display: "grid", gridTemplateColumns: "22px 105px 118px 150px 60px 1fr 1fr 1fr", gap: 6,
+ alignItems: "center", background: on ? "#FBFAF6" : (idx % 2 ? "#FCFCFA" : "transparent"),
+ borderRadius: 6, padding: "3px 2px", opacity: on ? 1 : 0.55 }}>
+ <input type="checkbox" checked={on} onChange={e => set(`install.${k}.applicable`, e.target.checked)} />
+ <span style={{ fontSize: 12, fontWeight: on ? 600 : 400, color: on ? "#1B2430" : "#B5AE9E" }}>{label}</span>
+ <DateInputDMY disabled={!on} value={c.install[k].date} onChange={e => set(`install.${k}.date`, e.target.value)}
+ style={{ padding: "5px 6px", fontSize: 11.5 }} />
+ <div style={{ minWidth: 0 }}>
+ {hasModel ? (
+ <ItemPicker category={k === "battery" ? "Battery" : k === "ev" ? "EV Charger" : "Cap Bank"} itemDirectory={itemDirectory}
+ model={c.install[k].model} onModelChange={v => set(`install.${k}.model`, v)}
+ onDescriptionChange={v => set(`install.${k}.description`, v)} />
+ ) : <span style={{ fontSize: 11, color: "#D5D0C4" }}>—</span>}
+ </div>
+ <div style={{ minWidth: 0 }}>
+ {hasModel ? (
+ <NumberInput value={c.install[k].qty} onChange={e => set(`install.${k}.qty`, e.target.value)} placeholder="1" style={{ padding: "5px 6px", fontSize: 11.5 }} />
+ ) : <span style={{ fontSize: 11, color: "#D5D0C4" }}>—</span>}
+ </div>
+ <TextInput disabled={!on} value={c.install[k].siteSupervisor} onChange={e => set(`install.${k}.siteSupervisor`, e.target.value)} placeholder="Name" style={{ padding: "5px 6px", fontSize: 11.5 }} />
+ <TextInput disabled={!on} value={c.install[k].installer} onChange={e => set(`install.${k}.installer`, e.target.value)} placeholder="Name/Team" style={{ padding: "5px 6px", fontSize: 11.5 }} />
+ <TextInput disabled={!on} value={c.install[k].wiringTeam} onChange={e => set(`install.${k}.wiringTeam`, e.target.value)} placeholder="Name/Team" style={{ padding: "5px 6px", fontSize: 11.5 }} />
+ </div>
+ );
+ })}
+
+ {c.install.otherItems.length > 0 && (
+ <div style={{ fontSize: 10, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.3, marginTop: 6, paddingLeft: 2 }}>OTHER ITEMS</div>
+ )}
+ {c.install.otherItems.map(it => (
+ <div key={it.id} style={{ display: "grid", gridTemplateColumns: "22px 105px 118px 1fr 28px", gap: 6,
+ alignItems: "center", background: it.applicable ? "#FBFAF6" : "transparent", borderRadius: 6, padding: "3px 2px", opacity: it.applicable ? 1 : 0.55 }}>
+ <input type="checkbox" checked={it.applicable} onChange={e => updateInstallOther(it.id, "applicable", e.target.checked)} />
+ <span style={{ fontSize: 11, color: "#9AA2AD" }}>Other</span>
+ <DateInputDMY disabled={!it.applicable} value={it.date} onChange={e => updateInstallOther(it.id, "date", e.target.value)} style={{ padding: "5px 6px", fontSize: 11.5 }} />
+ <TextInput value={it.name} onChange={e => updateInstallOther(it.id, "name", e.target.value)} placeholder="Item name" style={{ padding: "5px 6px", fontSize: 11.5 }} />
+ <button onClick={() => removeInstallOther(it.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "#C24141", padding: 0 }}>
+ <Trash2 size={14} />
+ </button>
+ </div>
+ ))}
+ </div>
+ </div>
+ <button onClick={addInstallOther} style={{ ...btnGhost, alignSelf: "flex-start" }}><Plus size={13}/> Add Other Item</button>
+ <AdminNote value={c.install.note} onChange={e => set("install.note", e.target.value)} />
+ </>
+ )}
+
+ {tab === "tnb" && (
+ <>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+ <Field label="Apply Date">
+ <DateInputDMY value={c.tnb.applyDate} onChange={e => set("tnb.applyDate", e.target.value)} />
+ </Field>
+ <Field label="Welcome Letter">
+ <DateInputDMY value={c.tnb.welcomeDate} onChange={e => set("tnb.welcomeDate", e.target.value)} />
+ </Field>
+ <Field label="TNB Account No.">
+ <TextInput value={c.tnb.tnbAccount} onChange={e => set("tnb.tnbAccount", e.target.value)} placeholder="TNB Account No." />
+ </Field>
+ <Field label="Branch">
+ <TextInput value={c.tnb.branch} onChange={e => set("tnb.branch", e.target.value)} placeholder="TNB Branch" />
+ </Field>
+ </div>
+ <div style={{ background: "#F0F6FB", border: "1px solid #CFE2F0", borderRadius: 10, padding: "10px 14px" }}>
+ <div style={{ fontSize: 11, color: "#2C5F8A", fontWeight: 700 }}>TNB Customer Care Line</div>
+ <div style={{ fontSize: 15, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 700, color: "#0B2A4A" }}>{TNB_CUSTOMER_CARE_LINE}</div>
+ </div>
+ {/* Welcome Letter received = TNB approved. Only that status's button shows once it's filled in. */}
+ {c.tnb.welcomeDate ? (
+ <WhatsAppNotifyBlock label="TNB" agentPhone={agentPhoneFor(c, agentDirectory)}
+ stages={[{ key: "approved", label: "Approved", text: buildTnbWhatsAppText(c, "approved") }]} />
+ ) : c.tnb.applyDate ? (
+ <WhatsAppNotifyBlock label="TNB" agentPhone={agentPhoneFor(c, agentDirectory)}
+ stages={[{ key: "submitted", label: "Submitted", text: buildTnbWhatsAppText(c, "submitted") }]} />
+ ) : (
+ <div style={{ fontSize: 11, color: "#B5AE9E" }}>Fill in Apply Date to enable the WhatsApp notification.</div>
+ )}
+ <AdminNote value={c.tnb.note} onChange={e => set("tnb.note", e.target.value)} />
+ </>
+ )}
+
+ {tab === "om" && (
+ <>
+ <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+ {c.om.records.map((r, i) => (
+ <div key={r.id} style={{ border: "1px solid #F0ECE1", borderRadius: 10, padding: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr auto", gap: 8 }}>
+ <Field label="Report Date"><DateInputDMY value={r.reportDate} onChange={e => updateOM(r.id, "reportDate", e.target.value)} /></Field>
+ <Field label="Issue Type"><Select value={r.issueType} onChange={e => updateOM(r.id, "issueType", e.target.value)} options={ISSUE_TYPE_OPTIONS} /></Field>
+ <Field label="Scheduled Date"><DateInputDMY value={r.scheduledDate} onChange={e => updateOM(r.id, "scheduledDate", e.target.value)} /></Field>
+ <button onClick={() => removeOM(r.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "#C24141", alignSelf: "end", paddingBottom: 8 }}>
+ <Trash2 size={15} />
+ </button>
+ </div>
+ <Field label="Issue Detail"><TextInput value={r.issueDetail} onChange={e => updateOM(r.id, "issueDetail", e.target.value)} placeholder="Describe the issue" /></Field>
+ <Field label="Resolved Date (fill in once done)"><DateInputDMY value={r.resolvedDate} onChange={e => updateOM(r.id, "resolvedDate", e.target.value)} style={{ maxWidth: 200 }} /></Field>
+ </div>
+ ))}
+ <button onClick={addOM} style={btnGhost}><Plus size={13}/> Add O&M Record</button>
+ </div>
+ <AdminNote value={c.om.note} onChange={e => set("om.note", e.target.value)} />
+ </>
+ )}
+
+ {tab === "insurance" && (
+ <>
+ <Field label="Policy No.">
+ <TextInput value={c.insurance.policyNo} onChange={e => set("insurance.policyNo", e.target.value)} placeholder="Policy No." style={{ maxWidth: 260 }} />
+ </Field>
+
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5, marginTop: 4 }}>
+ Coverage PeriodsRENEW
+ </div>
+ <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+ {c.insurance.periods.map((p) => (
+ <div key={p.id} style={{ display: "grid", gridTemplateColumns: "140px 1fr 1fr auto", gap: 8, alignItems: "center" }}>
+ <TextInput value={p.yearLabel} onChange={e => updateInsurancePeriod(p.id, "yearLabel", e.target.value)} placeholder="Year 1" />
+ <DateInputDMY value={p.startDate} onChange={e => updateInsurancePeriod(p.id, "startDate", e.target.value)} />
+ <DateInputDMY value={p.endDate} onChange={e => updateInsurancePeriod(p.id, "endDate", e.target.value)} />
+ <button onClick={() => removeInsurancePeriod(p.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "#C24141" }}>
+ <Trash2 size={14} />
+ </button>
+ </div>
+ ))}
+ <button onClick={addInsurancePeriod} style={{ ...btnGhost, alignSelf: "flex-start" }}><Plus size={13}/> Add Next Year</button>
+ </div>
+
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5, marginTop: 4 }}> Claim Record</div>
+ <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+ {c.insurance.claimRecords.map((r) => (
+ <div key={r.id} style={{ display: "grid", gridTemplateColumns: "155px 1fr auto", gap: 8, alignItems: "center" }}>
+ <DateInputDMY value={r.date} onChange={e => updateClaimRecord(r.id, "date", e.target.value)} />
+ <TextInput value={r.description} onChange={e => updateClaimRecord(r.id, "description", e.target.value)} placeholder="Claim description" />
+ <button onClick={() => removeClaimRecord(r.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "#C24141" }}>
+ <Trash2 size={14} />
+ </button>
+ </div>
+ ))}
+ <button onClick={addClaimRecord} style={{ ...btnGhost, alignSelf: "flex-start" }}><Plus size={13}/> Add Claim</button>
+ </div>
+
+ <AdminNote value={c.insurance.note} onChange={e => set("insurance.note", e.target.value)} />
+ </>
+ )}
+
+ {tab === "referral" && (
+ <>
+ <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+ <input type="checkbox" checked={c.referral.hasReferral}
+ onChange={e => set("referral.hasReferral", e.target.checked)} />
+ <span style={{ fontSize: 13.5, fontWeight: 600, color: "#4A6FA5" }}> Case Has Referral</span>
+ </label>
+ {c.referral.hasReferral && (
+ <>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+ <Field label="Full Name">
+ <TextInput value={c.referral.name} onChange={e => set("referral.name", e.target.value)} placeholder="Filled by referrer via link" />
+ </Field>
+ <Field label="IC Number">
+ <TextInput value={c.referral.ic} onChange={e => set("referral.ic", e.target.value)} placeholder="IC Number" />
+ </Field>
+ <Field label="TIN Number">
+ <TextInput value={c.referral.tin} onChange={e => set("referral.tin", e.target.value)} placeholder="TIN Number" />
+ </Field>
+ <Field label="Email Address">
+ <TextInput value={c.referral.email} onChange={e => set("referral.email", e.target.value)} placeholder="email@example.com" />
+ </Field>
+ <Field label="Date">
+ <DateInputDMY value={c.referral.date} onChange={e => set("referral.date", e.target.value)} />
+ </Field>
+ </div>
+
+ <div style={{ background: "#F0F6FB", border: "1px solid #CFE2F0", borderRadius: 10, padding: 12 }}>
+ <div style={{ fontSize: 11.5, fontWeight: 700, color: "#2C5F8A", marginBottom: 6 }}> Referral Link</div>
+ <div style={{ fontSize: 12, color: "#6B7686", marginBottom: 8 }}>
+ ICTINEmail—— case
+ </div>
+ <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+ <input readOnly value={referralLink} onFocus={e => e.target.select()}
+ style={{ flex: 1, minWidth: 220, padding: "8px 10px", borderRadius: 8, border: "1px solid #CFE2F0",
+ fontSize: 12, fontFamily: "'IBM Plex Mono', monospace", background: "#fff" }} />
+ <button onClick={copyReferralLink} style={{ ...btnGhost, padding: "8px 12px" }}>
+ <Link2 size={13} /> 
+ </button>
+ {linkCopied && <span style={{ fontSize: 11.5, color: "#3C8C63" }}>{linkCopied}</span>}
+ </div>
+ </div>
+
+ <div style={{ fontSize: 11.5, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5, marginTop: 4 }}>
+ Referral Info {c.referral.bankSubmittedAt && <span style={{ color: "#3C8C63", fontWeight: 600 }}> {fmtDate(c.referral.bankSubmittedAt)}</span>}
+ </div>
+ <div style={{ fontSize: 12, color: "#C24141", marginTop: -6 }}>
+ ⚠️ 
+ </div>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+ <Field label="Bank Name">
+ <TextInput value={c.referral.bankName} onChange={e => set("referral.bankName", e.target.value)} placeholder="Maybank / CIMB..." />
+ </Field>
+ <Field label="Account No.">
+ <TextInput value={c.referral.bankAccountNo} onChange={e => set("referral.bankAccountNo", e.target.value)} placeholder="Account No." />
+ </Field>
+ <Field label="Account Holder">
+ <TextInput value={c.referral.bankAccountHolder} onChange={e => set("referral.bankAccountHolder", e.target.value)} placeholder="Must match referrer" />
+ </Field>
+ </div>
+
+ {/* Once the bank details are confirmed correct, locking stops the referral link from being
+ usable to submit again — protects against the same link being forwarded to someone else,
+ or the referrer resubmitting by mistake, after Admin has already checked the details. */}
+ <div style={{ background: c.referral.locked ? "#EAF5EE" : "#FBF8F0",
+ border: `1px solid ${c.referral.locked ? "#B7DEC5" : "#E3D8B8"}`,
+ borderRadius: 10, padding: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+ <div>
+ <div style={{ fontSize: 12.5, fontWeight: 700, color: c.referral.locked ? "#2E7D6B" : "#B08A2E" }}>
+ {c.referral.locked ? "🔒 Referral Locked" : "🔓 Referral Not Locked"}
+ </div>
+ <div style={{ fontSize: 11, color: "#6B7686", marginTop: 2 }}>
+ {c.referral.locked
+ ? "The referral link can no longer be used to submit or change these details."
+ : "The referral link can still be used to submit or correct these details."}
+ </div>
+ </div>
+ <button onClick={() => set("referral.locked", !c.referral.locked)}
+ style={{ ...btnPrimary, background: c.referral.locked ? "#8B3A3A" : "#2E7D6B" }}>
+ {c.referral.locked ? "Unlock" : "Lock Referral"}
+ </button>
+ </div>
+
+ <AdminNote value={c.referral.note} onChange={e => set("referral.note", e.target.value)} />
+ </>
+ )}
+ </>
+ )}
+
+ {tab === "cancellation" && (
+ <>
+ <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+ <input type="checkbox" checked={c.cancellation.isCancelled}
+ onChange={e => set("cancellation.isCancelled", e.target.checked)} />
+ <span style={{ fontSize: 13.5, fontWeight: 600, color: "#8B3A3A" }}> Case Package Cancelled</span>
+ </label>
+ {c.cancellation.isCancelled && (
+ <>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+ <Field label="Cancel Date">
+ <DateInputDMY value={c.cancellation.cancelDate} onChange={e => set("cancellation.cancelDate", e.target.value)} />
+ </Field>
+ <Field label="Package Price (RM)">
+ <NumberInput value={c.pkg.sellingPrice} disabled style={{ opacity: 0.6 }} />
+ </Field>
+ </div>
+
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5, marginTop: 4 }}>
+ Collected
+ </div>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 12, alignItems: "end" }}>
+ <Field label="Collected Amount (RM)">
+ <NumberInput value={c.cancellation.collectedAmount} onChange={e => set("cancellation.collectedAmount", e.target.value)} placeholder="0" />
+ </Field>
+ <Field label="Collected Method">
+ <Select value={c.cancellation.collectedMethod} onChange={e => set("cancellation.collectedMethod", e.target.value)} options={["", ...COLLECTED_METHODS]} />
+ </Field>
+ <button onClick={() => set("cancellation.collectedAmount", String(paymentTotal(c)))} style={{ ...btnGhost, padding: "8px 12px", fontSize: 12 }}>
+ Total Collected {fmtMoney(paymentTotal(c))}
+ </button>
+ </div>
+
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5, marginTop: 4 }}> Refund</div>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+ <Field label="Refund Amount (RM)">
+ <NumberInput value={c.cancellation.refundAmount} onChange={e => set("cancellation.refundAmount", e.target.value)} placeholder="0 After bank charges" />
+ </Field>
+ <Field label="Refund Method">
+ <Select value={c.cancellation.refundMethod} onChange={e => set("cancellation.refundMethod", e.target.value)} options={["", ...REFUND_METHODS]} />
+ </Field>
+ <Field label="Company Refund Date">
+ <DateInputDMY value={c.cancellation.companyRefundDate} onChange={e => set("cancellation.companyRefundDate", e.target.value)} />
+ </Field>
+ </div>
+ <Field label="Refund Reason">
+ <TextArea value={c.cancellation.refundReason} onChange={e => set("cancellation.refundReason", e.target.value)} placeholder="Reason for cancellation" />
+ </Field>
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5, marginTop: 4 }}></div>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+ <Field label="Bank Name">
+ <TextInput value={c.cancellation.bankName} onChange={e => set("cancellation.bankName", e.target.value)} placeholder="Maybank / CIMB..." />
+ </Field>
+ <Field label="Account No.">
+ <TextInput value={c.cancellation.bankAccountNo} onChange={e => set("cancellation.bankAccountNo", e.target.value)} placeholder="Account No." />
+ </Field>
+ <Field label="Account Holder">
+ <TextInput value={c.cancellation.bankAccountHolder} onChange={e => set("cancellation.bankAccountHolder", e.target.value)} placeholder="Account Name" />
+ </Field>
+ </div>
+ <AdminNote value={c.cancellation.note} onChange={e => set("cancellation.note", e.target.value)} />
+ </>
+ )}
+ </>
+ )}
+ </div>
+
+ {c.editHistory && c.editHistory.length > 0 && (
+ <TabHistory c={c} deptKey={tab} />
+ )}
+
+ <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 6 }}>
+ <div>
+ {/* Only shown on the Package Details tab, so it can't be hit by accident while clearing a
+ typo on some other department's fields. Deleting moves the case to the Recycle Bin — it
+ is not gone immediately, and Admin can restore it there within 100 days. */}
+ {onDelete && tab === "package" && (
+ <button onClick={onDelete} style={{ ...btnGhost, color: "#C24141", borderColor: "#F0C9C9" }}>
+ <Trash2 size={13} /> Delete Case
+ </button>
+ )}
+ </div>
+ <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+ {savedFlash && <span style={{ fontSize: 12.5, color: "#3C8C63", fontWeight: 600 }}>✓ Saved</span>}
+ <button onClick={onCancel} style={btnGhost}></button>
+ <button onClick={() => {
+ // These four identify the case everywhere — reports, search, and the printed documents all
+ // depend on them, so a case can't be saved half-identified.
+ const missing = [];
+ if (!c.caseNumber) missing.push("Case ID");
+ if (!c.createdAt) missing.push("Date of Issue");
+ if (!c.agentName) missing.push("Agent");
+ if (!c.customerName) missing.push("Customer Full Name");
+ if (missing.length) {
+ alert(`Please fill in the following required field(s) before saving:\n\n- ${missing.join("\n- ")}`);
+ setTab("package");
+ return;
+ }
+ // An override bypasses the payment rule, so it can't be left anonymous.
+ if (c.payment.installOverride && !c.payment.overrideApprovedBy.trim()) {
+ alert("Special Approval is ticked but no approver name is recorded.\n\nPlease fill in 'Approved By' so the decision can be traced later.");
+ setTab("payment");
+ return;
+ }
+ // A payment with no date is invisible to every date-filtered report (deposit, payment
+ // progress, etc.), so block the save rather than let it silently go missing.
+ const undated = c.payment.records.filter(r => !r.date && (Number(r.amount) > 0));
+ if (undated.length) {
+ alert(`${undated.length} payment record(s) have an amount but no date.\n\nPayments without a date will NOT appear in any report. Please fill in the payment date before saving.`);
+ setTab("payment");
+ return;
+ }
+ onSave(c); setSavedFlash(true); setSpecsOpen(false); setTimeout(() => setSavedFlash(false), 2500);
+ }} style={btnPrimary}><Save size={14} /> Save Case</button>
+ </div>
+ </div>
+ </div>
+ );
+}
+
+const btnPrimary = {
+ display: "inline-flex", alignItems: "center", gap: 6, background: "#0B2A4A", color: "#fff",
+ border: "none", borderRadius: 9, padding: "9px 16px", fontSize: 13.5, fontWeight: 600, cursor: "pointer",
+ fontFamily: "'Inter', sans-serif",
+};
+const btnGhost = {
+ display: "inline-flex", alignItems: "center", gap: 6, background: "#fff", color: "#1B2430",
+ border: "1px solid #E2DDD0", borderRadius: 9, padding: "8px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer",
+ fontFamily: "'Inter', sans-serif",
+};
+
+/* ---------- Case detail (read-only, Agent view) ---------- */
+
+function CaseDetailReadOnly({ c, isAgentView, logDoc, actorName }) {
+ const [tab, setTab] = useState("package");
+ const [invoiceAmount, setInvoiceAmount] = useState("");
+ const [invoiceNote, setInvoiceNote] = useState("");
+ const setPrintDoc = useContext(PrintContext);
+ const stage = stageOf(c);
+ const total = paymentTotal(c);
+ const pct = paymentPercent(c);
+ const price = Number(c.pkg.sellingPrice) || 0;
+ const capacity = (((Number(c.pkg.panelCount) || 0) * (Number(c.pkg.panelSizeW) || 0)) / 1000).toFixed(2);
+ const caseNo = "CASE-" + (c.caseNumber || c.id.slice(0, 6).toUpperCase());
+
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+ <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+ <HeaderCard title="GENERAL INFORMATION">
+ <div style={{ background: "#F0F6FB", border: "1px solid #CFE2F0", borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
+ <div style={{ fontSize: 10.5, fontWeight: 700, color: "#2C5F8A", letterSpacing: 0.5 }}>CASE ID</div>
+ <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 16, fontWeight: 700, color: "#0B2A4A" }}>{caseNo}</div>
+ </div>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+ <Info label="Date of Issue" value={c.createdAt ? fmtDate(c.createdAt) : "-"} mono />
+ <div>
+ <div style={{ fontSize: 11, color: "#9AA2AD", fontWeight: 600, marginBottom: 4 }}>Status</div>
+ <Badge color={stage.color}>{stage.label} - {stage.en}</Badge>
+ </div>
+ <div>
+ <div style={{ fontSize: 11, color: "#9AA2AD", fontWeight: 600, marginBottom: 4 }}>Package Type</div>
+ <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+ <Badge color={PACKAGE_TYPE_COLORS[c.pkg.packageType] || "#0B2A4A"}>{c.pkg.packageType}</Badge>
+ {c.pkg.caseType && c.pkg.caseType !== "New Installation" && c.pkg.packageType === "Solar Package" && <Badge color={CASE_TYPE_COLORS[c.pkg.caseType] || "#9AA2AD"}>{c.pkg.caseType}</Badge>}
+ {isEV(c) && c.pkg.evJobType && <Badge color={EV_JOB_COLORS[c.pkg.evJobType] || "#9AA2AD"}>{c.pkg.evJobType}</Badge>}
+ {c.payment.isLoanCase && <Badge color="#2C5F8A">LOAN</Badge>}
+ {c.payment.installOverride && <Badge color="#C24141">⚡ SPECIAL</Badge>}
+ </div>
+ </div>
+ <div>
+ <div style={{ fontSize: 11, color: "#9AA2AD", fontWeight: 600, marginBottom: 4 }}>Payment Status</div>
+ <Badge color={pct >= 100 ? "#3C8C63" : pct >= 60 ? "#C89B3C" : pct > 0 ? "#D98C3D" : "#9AA2AD"}>
+ {pct >= 100 ? "FULL PAYMENT" : pct > 0 ? `${pct}% PAID` : "NO PAYMENT"}
+ </Badge>
+ </div>
+ </div>
+ <div style={{ marginTop: 12 }}><Info label="Agent" value={agentDisplay(c)} /></div>
+ </HeaderCard>
+ <HeaderCard title="CUSTOMER PROFILE">
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+ <Info label="Full Name" value={c.customerName || "-"} />
+ <Info label="Property Type" value={c.pkg.propertyType || "-"} />
+ <Info label="IC / Passport No." value={c.ic || "-"} />
+ <Info label="Email" value={c.customerEmail || "-"} />
+ <Info label="Contact" value={c.customerPhone || "-"} />
+ <Info label="TIN Number" value={c.tin || "-"} />
+ </div>
+ {c.billingName && c.billingName.trim() && c.billingName.trim() !== c.customerName.trim() && (
+ <div style={{ marginBottom: 12 }}><Info label="Billing Name" value={c.billingName} /></div>
+ )}
+ <Info label="Installation Address" value={c.installAddress || "-"} />
+ </HeaderCard>
+ </div>
+
+ <DeptTabBar active={tab} onChange={setTab} packageType={c.pkg.packageType} caseType={c.pkg.caseType} />
+
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 18, display: "flex", flexDirection: "column", gap: 14 }}>
+
+ {tab === "package" && (
+ <>
+ {!isAgentView && (
+ <>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, fontSize: 13.5 }}>
+ <Info label="Property Type" value={c.pkg.propertyType} />
+ <Info label="Phase" value={c.pkg.phaseType || "-"} />
+ <Info label="Region" value={c.pkg.region ? `${c.pkg.region}${c.pkg.district ? " - " + c.pkg.district : ""}` : "-"} />
+ {c.pkg.packageType === "Solar Package" && (
+ <>
+ <Info label="System Type" value={c.pkg.systemType} />
+ <Info label="Panel Qty" value={c.pkg.panelCount || "-"} mono />
+ <Info label="Size" value={c.pkg.panelSizeW ? `${c.pkg.panelSizeW}W` : "-"} mono />
+ <Info label="Inverter" value={c.pkg.inverterModel || "-"} />
+ </>
+ )}
+ </div>
+ {((c.pkg.packageType === "Solar Package" && c.pkg.battery.model) || (c.pkg.packageType === "EV Charger Package" && c.pkg.evCharger.model) || c.pkg.otherEntries.length > 0) && (
+ <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 13 }}>
+ {c.pkg.packageType === "Solar Package" && c.pkg.battery.model && <Info label="Battery" value={`${c.pkg.battery.model} x${c.pkg.battery.qty || 1} - ${fmtMoney(c.pkg.battery.price)}`} />}
+ {c.pkg.packageType === "EV Charger Package" && c.pkg.evCharger.model && <Info label="EV Charger" value={`${c.pkg.evCharger.model} x${c.pkg.evCharger.qty || 1} - ${fmtMoney(c.pkg.evCharger.price)}`} />}
+ {c.pkg.otherEntries.map(e => <Info key={e.id} label="Other" value={`${e.name} x${e.qty || 1} - ${fmtMoney(e.price)}`} />)}
+ </div>
+ )}
+ {Number(c.pkg.basePrice) > 0 && (
+ <Info label="Base Package Price" value={fmtMoney(c.pkg.basePrice)} mono />
+ )}
+ {c.pkg.discountEntries && c.pkg.discountEntries.length > 0 && (
+ <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+ <div style={{ fontSize: 11, color: "#9AA2AD", fontWeight: 600 }}> Discount</div>
+ {c.pkg.discountEntries.map(e => (
+ <div key={e.id} style={{ fontSize: 12.5, color: "#C24141" }}>{e.description || "Discount"}: -{fmtMoney(e.amount)}</div>
+ ))}
+ </div>
+ )}
+ {c.pkg.eppEntries && c.pkg.eppEntries.length > 0 && (
+ <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+ <div style={{ fontSize: 11, color: "#9AA2AD", fontWeight: 600 }}>EPP </div>
+ {c.pkg.eppEntries.map((e, i) => (
+ <div key={e.id} style={{ fontSize: 12.5, color: "#1B2430" }}>
+ #{i + 1} {e.bank} {e.months} @ {e.ratePct}% — {fmtMoney2(e.principal)} + {fmtMoney2(e.interest)}
+ </div>
+ ))}
+ </div>
+ )}
+ <Info label="Selling Price" value={fmtMoney(price)} mono />
+ {/* pkg.note is internal-only (Admin use), intentionally not shown to Agent */}
+ </>
+ )}
+
+ <div>
+ <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+ <span style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5 }}>BILLING DETAILS</span>
+ <Badge color="#0B2A4A">PACKAGE</Badge>
+ </div>
+ <div style={{ border: "1px solid #E9E4D8", borderRadius: 10, overflow: "hidden" }}>
+ <table style={{ width: "100%", borderCollapse: "collapse" }}>
+ <thead>
+ <tr style={{ background: "#FBFAF6" }}>
+ <th style={{ ...thStyle, width: "50%" }}>DESCRIPTION</th>
+ <th style={thStyle}>QTY</th>
+ <th style={thStyle}>UNIT RATE</th>
+ <th style={thStyle}>AMOUNT</th>
+ </tr>
+ </thead>
+ <tbody>
+ {buildBillingLines(c).lines.map((l, i) => (
+ <tr key={i}>
+ <td style={{ ...tdStyle, fontSize: 12, lineHeight: 1.7, whiteSpace: "pre-line", verticalAlign: "top", color: l.isDiscount ? "#C24141" : "#1B2430" }}>{l.desc}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace", verticalAlign: "top" }}>{l.qty}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace", verticalAlign: "top" }}>{fmtMoney(l.rate)}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 700, verticalAlign: "top", color: l.isDiscount ? "#C24141" : "#1B2430" }}>{fmtMoney(l.amt)}</td>
+ </tr>
+ ))}
+ <tr>
+ <td colSpan={3} style={{ ...tdStyle, textAlign: "right", fontWeight: 700 }}>TOTAL AMOUNT (RM)</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 700 }}>{fmtMoney(price)}</td>
+ </tr>
+ </tbody>
+ </table>
+ </div>
+ </div>
+
+ <div style={{ display: "flex", gap: 10, flexWrap: "wrap", paddingTop: 4, borderTop: "1px solid #F0ECE1" }}>
+ <button onClick={() => {
+ if (logDoc) logDoc({ caseId: c.id, customerName: c.customerName, docType: "Quotation", actor: actorName || "Admin" });
+ setPrintDoc(buildQuotationDoc(c));
+ }} style={btnGhost}>
+ <FileDown size={14} /> Quotation
+ </button>
+ </div>
+
+ <div style={{ background: "#FBF8F0", border: "1px dashed #E3D8B8", borderRadius: 10, padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+ <div style={{ fontSize: 11.5, fontWeight: 700, color: "#B08A2E", letterSpacing: 0.3 }}> PROFORMA INVOICE</div>
+ <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+ {[5, 75, 20, 100].map(pct => (
+ <button key={pct} onClick={() => setInvoiceAmount(String(Math.round(price * pct / 100)))}
+ style={{ ...btnGhost, padding: "5px 10px", fontSize: 12 }}>{pct}% ({fmtMoney(Math.round(price * pct / 100))})</button>
+ ))}
+ </div>
+ <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", gap: 10 }}>
+ <Field label="Amount (RM)">
+ <NumberInput value={invoiceAmount} onChange={e => setInvoiceAmount(e.target.value)} placeholder="% Manual or select % above" />
+ </Field>
+ <Field label="Description">
+ <TextInput value={invoiceNote} onChange={e => setInvoiceNote(e.target.value)} placeholder="Deposit / SEDA" />
+ </Field>
+ </div>
+ <button
+ onClick={() => {
+ if (!(Number(invoiceAmount) > 0)) return;
+ const { seq, logId } = logDoc ? logDoc({ caseId: c.id, customerName: c.customerName, docType: "Proforma Invoice", amount: Number(invoiceAmount), note: invoiceNote, actor: actorName || "Admin" }) : { seq: 1, logId: null };
+ setPrintDoc(buildInvoiceDoc(c, Number(invoiceAmount), invoiceNote, seq, logId));
+ }}
+ disabled={!(Number(invoiceAmount) > 0)}
+ style={{ ...btnPrimary, opacity: Number(invoiceAmount) > 0 ? 1 : 0.45, cursor: Number(invoiceAmount) > 0 ? "pointer" : "not-allowed", alignSelf: "flex-start" }}
+ >
+ <FileDown size={14} /> Proforma Invoice
+ </button>
+ <div style={{ fontSize: 11, color: "#9AA2AD" }}> — Admin </div>
+ </div>
+ <AdminNote value={c.pkg.note2} readOnly />
+ </>
+ )}
+
+ {tab === "payment" && (
+ <>
+ <div style={{ display: "flex", gap: 18, fontFamily: "'IBM Plex Mono', monospace", fontSize: 13.5, flexWrap: "wrap" }}>
+ <span> Price: <b>{fmtMoney(price)}</b></span>
+ <span style={{ color: "#3C8C63" }}> Collected: <b>{fmtMoney(total)}</b> ({pct}%)</span>
+ <span style={{ color: price - total > 0 ? "#C24141" : "#3C8C63" }}> Balance: <b>{fmtMoney(price - total)}</b></span>
+ </div>
+ <div style={{ height: 8, background: "#F0ECE1", borderRadius: 6, overflow: "hidden" }}>
+ <div style={{ width: `${pct}%`, height: "100%", background: "linear-gradient(90deg,#0B2A4A,#C89B3C)" }} />
+ </div>
+ {c.payment.isLoanCase && (
+ <div style={{ background: "#F0F6FB", border: "1px solid #CFE2F0", borderRadius: 10, padding: "8px 12px", fontSize: 12.5, color: "#2C5F8A", display: "flex", flexDirection: "column", gap: 4 }}>
+ <div>Loan Case — {c.payment.loReceivedDate ? `LO Received ${fmtDate(c.payment.loReceivedDate)}` : "LO LO Not Received Yet"}</div>
+ {(c.payment.loanBank || c.payment.loanApprovedAmount || c.payment.loanRefNo) && (
+ <div style={{ fontSize: 12 }}>
+ {c.payment.loanBank && <> Bank: <b>{c.payment.loanBank}</b>　</>}
+ {c.payment.loanApprovedAmount && <> Approved: <b>{fmtMoney(c.payment.loanApprovedAmount)}</b>　</>}
+ {c.payment.loanRefNo && <>Ref No: <b>{c.payment.loanRefNo}</b></>}
+ </div>
+ )}
+ </div>
+ )}
+ {c.payment.records.length > 0 ? (
+ <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+ {c.payment.records.slice().sort((a,b)=>(a.date||"").localeCompare(b.date||"")).map((r, i) => (
+ <div key={r.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 13,
+ padding: "6px 10px", background: "#FBFAF6", borderRadius: 8 }}>
+ <span>{i + 1} {r.date ? fmtDate(r.date) : "-"} {r.bank && ` ${r.bank}`} {r.paymentMode && ` ${r.paymentMode}`} {r.note && ` ${r.note}`}</span>
+ {r.verifiedDate && <span style={{ fontSize: 11, color: "#3C8C63", fontWeight: 600 }}>✓ Verified {fmtDate(r.verifiedDate)}</span>}
+ <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600 }}>{fmtMoney(r.amount)}</span>
+ </div>
+ ))}
+ </div>
+ ) : <Empty text="No Payment Records" />}
+ <AdminNote value={c.payment.note} readOnly />
+ </>
+ )}
+
+ {tab === "seda" && (
+ <>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+ <Info label="Submit Date" value={c.seda.submitDate ? fmtDateFull(c.seda.submitDate) : "Not Submitted"} mono />
+ <Info label="Approval Date" value={c.seda.approvalDate ? fmtDateFull(c.seda.approvalDate) : "Not Approved"} mono />
+ <Info label="Certification No." value={c.seda.certificationNo || "-"} mono />
+ <Info label="EOT Date" value={c.seda.eotDate ? fmtDateFull(c.seda.eotDate) : "-"} mono />
+ <Info label="Milestone Date" value={c.seda.milestoneDate ? fmtDateFull(c.seda.milestoneDate) : "Not Updated"} mono />
+ </div>
+ <AdminNote value={c.seda.note} readOnly />
+ </>
+ )}
+
+ {tab === "install" && (
+ <>
+ {c.payment.isLoanCase && !c.payment.loReceivedDate && (
+ <div style={{ background: "#FBEAEA", border: "1px solid #E3A9A9", borderRadius: 10, padding: "10px 14px", display: "flex", alignItems: "center", gap: 8 }}>
+ <span style={{ fontSize: 18 }}>⚠️</span>
+ <div style={{ fontSize: 12.5, color: "#8B3A3A", fontWeight: 600, lineHeight: 1.5 }}>
+ Case LO(Letter of Offer)——<br/>
+ Loan case — LO not received yet. Installation should not be scheduled.
+ </div>
+ </div>
+ )}
+ <Info label="Installation Date" value={c.install.deliveryDate ? `${fmtDateFull(c.install.deliveryDate)}${c.delivery.installTimeSlot ? ` - ${c.delivery.installTimeSlot}` : ""}${c.delivery.installTime ? ` @${c.delivery.installTime}` : ""}` : "Not Scheduled"} mono />
+ <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+ {installComponentsForPackageType(c.pkg.packageType)
+ .filter(([k]) => c.install[k].applicable)
+ .map(([k, label]) => (
+ <div key={k} style={{ borderBottom: "1px solid #F0ECE1", paddingBottom: 6 }}>
+ <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13.5 }}>
+ {c.install[k].date ? <CheckCircle2 size={15} color="#3C8C63" /> : <Circle size={15} color="#C9C2AE" />}
+ <span style={{ width: 150 }}>{label}</span>
+ <span style={{ fontFamily: "'IBM Plex Mono', monospace", color: c.install[k].date ? "#1B2430" : "#B5AE9E" }}>
+ {c.install[k].date ? fmtDateFull(c.install[k].date) : "Pending"}
+ </span>
+ {(k === "battery" || k === "ev") && c.install[k].model && (
+ <span style={{ fontSize: 12, color: "#9AA2AD" }}> - {c.install[k].model} x{c.install[k].qty || 1}</span>
+ )}
+ </div>
+ {(c.install[k].siteSupervisor || c.install[k].installer || c.install[k].wiringTeam) && (
+ <div style={{ fontSize: 11.5, color: "#9AA2AD", marginTop: 2, paddingLeft: 23 }}>
+ {c.install[k].siteSupervisor && `Supervisor: ${c.install[k].siteSupervisor}`}
+ {c.install[k].installer && ` - Installer: ${c.install[k].installer}`}
+ {c.install[k].wiringTeam && ` - Wiring: ${c.install[k].wiringTeam}`}
+ </div>
+ )}
+ </div>
+ ))}
+ {c.install.otherItems.filter(it => it.applicable).map(it => (
+ <div key={it.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13.5 }}>
+ {it.date ? <CheckCircle2 size={15} color="#3C8C63" /> : <Circle size={15} color="#C9C2AE" />}
+ <span style={{ width: 150 }}>{it.name || "Other Items"}</span>
+ <span style={{ fontFamily: "'IBM Plex Mono', monospace", color: it.date ? "#1B2430" : "#B5AE9E" }}>
+ {it.date ? fmtDateFull(it.date) : "Pending"}
+ </span>
+ </div>
+ ))}
+ </div>
+ <AdminNote value={c.install.note} readOnly />
+ </>
+ )}
+
+ {tab === "tnb" && (
+ <>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+ <Info label="Apply Date" value={c.tnb.applyDate ? fmtDateFull(c.tnb.applyDate) : "Not Applied"} mono />
+ <Info label="Welcome Letter" value={c.tnb.welcomeDate ? fmtDateFull(c.tnb.welcomeDate) : "Not Received"} mono />
+ <Info label="TNB Account No." value={c.tnb.tnbAccount || "-"} mono />
+ <Info label="Branch" value={c.tnb.branch || "-"} />
+ </div>
+ <div style={{ background: "#F0F6FB", border: "1px solid #CFE2F0", borderRadius: 10, padding: "10px 14px" }}>
+ <div style={{ fontSize: 11, color: "#2C5F8A", fontWeight: 700 }}>TNB Customer Care Line</div>
+ <div style={{ fontSize: 15, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 700, color: "#0B2A4A" }}>{TNB_CUSTOMER_CARE_LINE}</div>
+ </div>
+ <AdminNote value={c.tnb.note} readOnly />
+ </>
+ )}
+
+ {tab === "om" && (
+ <>
+ {c.om.records.length > 0 ? (
+ <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+ {c.om.records.map(r => (
+ <div key={r.id} style={{ border: "1px solid #F0ECE1", borderRadius: 10, padding: 10, fontSize: 13 }}>
+ <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+ <Badge color="#C24141">{r.issueType} {ISSUE_TYPE_EN[r.issueType] || ""}</Badge>
+ <span style={{ color: r.resolvedDate ? "#3C8C63" : "#D98C3D", fontWeight: 600, fontSize: 12 }}>
+ {r.resolvedDate ? ` Resolved ${fmtDateFull(r.resolvedDate)}` : "In Progress"}
+ </span>
+ </div>
+ <div style={{ color: "#1B2430", marginBottom: 4 }}>{r.issueDetail || "-"}</div>
+ <div style={{ color: "#6B7686", fontFamily: "'IBM Plex Mono', monospace", fontSize: 12 }}>
+ Reported: {r.reportDate ? fmtDateFull(r.reportDate) : "-"} → Scheduled: {r.scheduledDate ? fmtDateFull(r.scheduledDate) :" Pending"}
+ </div>
+ </div>
+ ))}
+ </div>
+ ) : <Empty text="No O&M records" />}
+ <AdminNote value={c.om.note} readOnly />
+ </>
+ )}
+
+ {tab === "insurance" && (
+ <>
+ <Info label="Policy No." value={c.insurance.policyNo || "-"} mono />
+ {c.insurance.periods.length > 0 ? (
+ <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+ <div style={{ fontSize: 11, color: "#9AA2AD", fontWeight: 600 }}> Coverage Periods</div>
+ {c.insurance.periods.map(p => (
+ <div key={p.id} style={{ fontSize: 13, display: "flex", gap: 10 }}>
+ <span style={{ fontWeight: 600, width: 130 }}>{p.yearLabel}</span>
+ <span style={{ fontFamily: "'IBM Plex Mono', monospace", color: "#6B7686" }}>
+ {p.startDate ? fmtDateFull(p.startDate) : "-"} - {p.endDate ? fmtDateFull(p.endDate) : "-"}
+ </span>
+ </div>
+ ))}
+ </div>
+ ) : <Empty text="No Insurance Period Set" />}
+ {c.insurance.claimRecords.length > 0 && (
+ <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+ <div style={{ fontSize: 11, color: "#9AA2AD", fontWeight: 600 }}> Claim Record</div>
+ {c.insurance.claimRecords.map(r => (
+ <div key={r.id} style={{ fontSize: 13, display: "flex", gap: 10 }}>
+ <span style={{ fontFamily: "'IBM Plex Mono', monospace", color: "#6B7686" }}>{r.date ? fmtDateFull(r.date) : "-"}</span>
+ <span>{r.description || "-"}</span>
+ </div>
+ ))}
+ </div>
+ )}
+ <AdminNote value={c.insurance.note} readOnly />
+ </>
+ )}
+
+ {tab === "referral" && (
+ <>
+ {c.referral && c.referral.hasReferral ? (
+ <>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+ <Info label="Referrer Name" value={c.referral.name || "-"} />
+ <Info label="Registration Date" value={c.referral.date ? fmtDateFull(c.referral.date) : "-"} mono />
+ <Info label="IC Number" value={c.referral.ic || "-"} mono />
+ <Info label="TIN Number" value={c.referral.tin || "-"} mono />
+ <Info label="Email" value={c.referral.email || "-"} />
+ </div>
+ <div style={{ fontSize: 11, color: "#9AA2AD", fontWeight: 700, marginTop: 6 }}>
+ {c.referral.bankSubmittedAt ? ` ${fmtDateFull(c.referral.bankSubmittedAt)}` : "Not Submitted"}
+ </div>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+ <Info label="Bank Name" value={c.referral.bankName || "-"} />
+ <Info label="Account No." value={c.referral.bankAccountNo || "-"} mono />
+ <Info label="Account Holder" value={c.referral.bankAccountHolder || "-"} />
+ </div>
+ <AdminNote value={c.referral.note} readOnly />
+ </>
+ ) : <Empty text="Case" />}
+ </>
+ )}
+
+ {tab === "cancellation" && (
+ <>
+ {c.cancellation && c.cancellation.isCancelled ? (
+ <>
+ <Badge color="#8B3A3A"> Case Cancelled</Badge>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 4 }}>
+ <Info label="Cancel Date" value={c.cancellation.cancelDate ? fmtDateFull(c.cancellation.cancelDate) : "-"} mono />
+ <Info label="Collected" value={`${fmtMoney(c.cancellation.collectedAmount)} ${c.cancellation.collectedMethod ? " - " + c.cancellation.collectedMethod : ""}`} mono />
+ <Info label="Refund Amount" value={fmtMoney(c.cancellation.refundAmount)} mono />
+ <Info label="Refund Method" value={c.cancellation.refundMethod || "-"} />
+ <Info label="Company Refund Date" value={c.cancellation.companyRefundDate ? fmtDateFull(c.cancellation.companyRefundDate) : "Not Refunded"} mono />
+ <Info label="Refund Reason" value={c.cancellation.refundReason || "-"} />
+ </div>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+ <Info label="Customer Bank" value={c.cancellation.bankName || "-"} />
+ <Info label="Account No." value={c.cancellation.bankAccountNo || "-"} mono />
+ <Info label="Account Holder" value={c.cancellation.bankAccountHolder || "-"} />
+ </div>
+ <AdminNote value={c.cancellation.note} readOnly />
+ </>
+ ) : <Empty text="Case" />}
+ </>
+ )}
+ </div>
+ </div>
+ );
+}
+
+function Info({ label, value, mono }) {
+ return (
+ <div>
+ <div style={{ fontSize: 11, color: "#9AA2AD", fontWeight: 600, marginBottom: 2 }}>{label}</div>
+ <div style={{ fontSize: 13.5, color: "#1B2430", fontFamily: mono ? "'IBM Plex Mono', monospace" : "'Inter', sans-serif" }}>{value}</div>
+ </div>
+ );
+}
+function Empty({ text }) {
+ return <div style={{ fontSize: 12.5, color: "#B5AE9E", fontStyle: "italic", padding: "6px 0" }}>{text}</div>;
+}
+
+/* ---------- Case card (list item) ---------- */
+
+function CaseCard({ c, onClick }) {
+ const stage = stageOf(c);
+ const score = completionScore(c);
+ const PType = PROPERTY_TYPES.find(p => p.v === c.pkg.propertyType) || PROPERTY_TYPES[0];
+ return (
+ <button onClick={onClick} style={{
+ display: "flex", alignItems: "center", gap: 14, width: "100%", textAlign: "left",
+ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: "13px 16px", cursor: "pointer",
+ }}>
+ <SunArc percent={score} />
+ <div style={{ flex: 1, minWidth: 0 }}>
+ <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+ <span style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 15, color: "#1B2430" }}>
+ {c.customerName || "Unnamed Customer"}
+ </span>
+ <PType.icon size={14} color="#8A93A0" />
+ <span style={{ fontSize: 12, color: "#8A93A0" }}>
+ {c.pkg.propertyType}{c.pkg.packageType === "Solar Package" ? ` - ${c.pkg.systemType}` : ""}
+ </span>
+ {c.pkg.packageType !== "Solar Package" && (
+ <Badge color={PACKAGE_TYPE_COLORS[c.pkg.packageType] || "#9AA2AD"} style={{ fontSize: 10 }}>
+ {c.pkg.packageType === "EV Charger Package" ? "EV" : "Other"}
+ </Badge>
+ )}
+ </div>
+ <div style={{ display: "flex", gap: 14, fontSize: 12, color: "#8A93A0", fontFamily: "'IBM Plex Mono', monospace", flexWrap: "wrap" }}>
+ <span>Agent: {agentDisplay(c)}</span>
+ <span>: {firstPaymentDate(c) ? monthLabel(monthKey(firstPaymentDate(c))) : "No Deposit"}</span>
+ <span> {paymentPercent(c)}%</span>
+ <span>{fmtMoney(c.pkg.sellingPrice)}</span>
+ </div>
+ </div>
+ <Badge color={stage.color}>{stage.label} - {stage.en}</Badge>
+ <ChevronRight size={16} color="#C9C2AE" />
+ </button>
+ );
+}
+
+/* ---------- Dashboard ---------- */
+
+function Dashboard({ cases, itemDirectory, docLogs, agentDirectory, deliveryOrders }) {
+ const today = new Date().toISOString().slice(0, 10);
+ const monthStart = today.slice(0, 8) + "01";
+ const [rangeStart, setRangeStart] = useState(monthStart);
+ const [rangeEnd, setRangeEnd] = useState(today);
+ const setPrintDoc = useContext(PrintContext);
+
+ const dealsThisMonth = cases.filter(c => inRange(firstPaymentDate(c), rangeStart, rangeEnd));
+ const installedThisMonth = cases.filter(c => installComplete(c) && inRange(lastInstallDate(c), rangeStart, rangeEnd));
+
+ const byType = (list) => PROPERTY_TYPES.map(p => ({ type: p.v, label: `${p.en}`, icon: p.icon, count: list.filter(c => c.pkg.propertyType === p.v).length }));
+
+ const stageCounts = {};
+ cases.forEach(c => { const st = stageOf(c); const key = `${st.label} ${st.en}`; stageCounts[key] = (stageCounts[key] || 0) + 1; });
+
+ const buckets = [
+ { label: "0–29%", test: (p) => p < 30, color: "#C24141" },
+ { label: "30–59%", test: (p) => p >= 30 && p < 60, color: "#D98C3D" },
+ { label: "60–99%", test: (p) => p >= 60 && p < 100, color: "#C89B3C" },
+ { label: "100%", test: (p) => p >= 100, color: "#3C8C63" },
+ ].map(b => ({ ...b, count: cases.filter(c => b.test(paymentPercent(c))).length }));
+
+ const totalValue = cases.reduce((s, c) => s + (Number(c.pkg.sellingPrice) || 0), 0);
+ const completedCases = cases.filter(c => stageOf(c).label === "Completed").length;
+
+ const [reportAgent, setReportAgent] = useState("All");
+ // Pull from the Agent directory rather than from existing cases — a newly registered agent
+ // has no cases yet, so deriving the list from cases would hide them from this filter.
+ const agentNames = Array.from(new Set([
+ ...(agentDirectory || []).map(a => a.name),
+ ...cases.map(c => c.agentName),
+ ].filter(Boolean))).sort();
+ const reportCases = reportAgent === "All" ? cases : cases.filter(c => c.agentName === reportAgent);
+ // Wraps every report so picking a single Agent above also stamps that onto the printed
+ // report's title/header — without needing to touch each individual report-builder function.
+ const printReport = (doc) => {
+ if (reportAgent === "All") { setPrintDoc(doc); return; }
+ setPrintDoc({
+ title: `${doc.title} - ${reportAgent}`,
+ html: doc.html.replace("</h1>", ` &nbsp; - &nbsp; Agent: ${reportAgent}</h1>`),
+ });
+ };
+
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
+ <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+ <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 20, margin: 0, color: "#1B2430" }}> Dashboard</h2>
+ <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
+ <Field label="From"><DateInputDMY value={rangeStart} onChange={e => setRangeStart(e.target.value)} /></Field>
+ <Field label="To"><DateInputDMY value={rangeEnd} onChange={e => setRangeEnd(e.target.value)} /></Field>
+ </div>
+ </div>
+
+ <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12 }}>
+ <StatCard label="Case Total Cases" value={cases.length} sub="All" />
+ <StatCard label="Total Value" value={fmtMoney(totalValue)} sub="cases All Cases" />
+ <StatCard label="Case Completed" value={completedCases} sub="Completed" color="#3C8C63" />
+ </div>
+
+ <Panel title="Report Center" sub={` / PDF— ${dateRangeLabel(rangeStart, rangeEnd)}`}>
+ <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4, flexWrap: "wrap" }}>
+ <Field label="Agent Agent Filter Agent">
+ <select value={reportAgent} onChange={e => setReportAgent(e.target.value)} style={{ ...inputStyle, width: 220 }}>
+ <option value="All"> Agent All Agents</option>
+ {agentNames.map(a => <option key={a} value={a}>{a}</option>)}
+ </select>
+ </Field>
+ {reportAgent !== "All" && (
+ <span style={{ fontSize: 11.5, color: "#2C5F8A", background: "#F0F6FB", border: "1px solid #CFE2F0", borderRadius: 6, padding: "4px 8px", alignSelf: "flex-end", marginBottom: 2 }}>
+ <b>{reportAgent}</b> case {reportCases.length} 
+ </span>
+ )}
+ </div>
+ <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+ <ReportGroup label="Deposit / Payment Progress" color={DEPT.payment.color}>
+ <ReportBtn onClick={() => printReport(buildAgentFullListReportDoc(reportCases))}>Agent Full Case List</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildDepositReportDoc(rangeStart, rangeEnd, reportCases))}>Deposit Report</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildPaymentThresholdReportDoc(60, rangeStart, rangeEnd, reportCases))}>60%+ Paid</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildPaymentThresholdReportDoc(100, rangeStart, rangeEnd, reportCases))}> Full Payment</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildPendingLoReportDoc(reportCases))}>Pending Letter of Offer</ReportBtn>
+ </ReportGroup>
+ <ReportGroup label="SEDA" color={DEPT.seda.color}>
+ <ReportBtn onClick={() => printReport(buildSedaReportDoc(rangeStart, rangeEnd, reportCases))}>SEDA Application Report</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildPendingSedaSubmissionReportDoc(reportCases))}>Pending SEDA Submission</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildPendingSedaApprovalReportDoc(reportCases))}>Pending SEDA Approval</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildPendingMilestoneReportDoc(reportCases))}>Pending Update Milestone</ReportBtn>
+ </ReportGroup>
+ <ReportGroup label="TNB" color={DEPT.tnb.color}>
+ <ReportBtn onClick={() => printReport(buildTnbReportDoc(rangeStart, rangeEnd, reportCases))}>TNB Application Report</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildPendingTnbApplicationReportDoc(reportCases))}>Pending TNB Application</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildPendingWelcomeLetterReportDoc(reportCases))}>Pending Welcome Letter</ReportBtn>
+ </ReportGroup>
+ <ReportGroup label="Installation / O&M / Summary" color={DEPT.install.color}>
+ <ReportBtn onClick={() => printReport(buildInstallReportDoc(rangeStart, rangeEnd, reportCases))}>Installation Report</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildOutstandingAfterInstallReportDoc(reportCases))}>Installed but Not Fully Paid</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildInstallQueueReportDoc(reportCases))}>Install Queue</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildOMReportDoc(reportCases))}>O&M Report</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildPropertyTypeSummaryDoc(rangeStart, rangeEnd, reportCases))}>Property Type Summary</ReportBtn>
+ </ReportGroup>
+ {/* Warehouse sits on its own — purchasing and goods movement are a different job from
+ tracking installation progress, and the two get read by different people. */}
+ <ReportGroup label="Warehouse / Purchasing" color="#7A5C2E">
+ <ReportBtn onClick={() => printReport(buildMaterialRequirementReportDoc(reportCases))}>Material Requirement (Purchasing)</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildInstalledMaterialReportDoc(rangeStart, rangeEnd, reportCases))}>Installed Material Report</ReportBtn>
+ <ReportBtn onClick={() => printReport(buildShipmentReportDoc(rangeStart, rangeEnd, reportCases, itemDirectory))}>Shipment Report</ReportBtn>
+ <ReportBtn onClick={() => {
+ const reportCaseIds = new Set(reportCases.map(c => c.id));
+ printReport(buildDOReportDoc(rangeStart, rangeEnd, (deliveryOrders || []).filter(d => reportCaseIds.has(d.caseId)), reportCases));
+ }}>Delivery Order Report</ReportBtn>
+ </ReportGroup>
+ <ReportGroup label="Cancelled Packages" color={DEPT.cancellation.color}>
+ <ReportBtn onClick={() => printReport(buildCancellationReportDoc(rangeStart, rangeEnd, reportCases))}> Cancellation Report</ReportBtn>
+ </ReportGroup>
+ <ReportGroup label="Document Log" color="#6B4E9E">
+ <ReportBtn onClick={() => printReport(buildDocLogReportDoc(rangeStart, rangeEnd, reportCases, docLogs))}> Document LogQuotation / Invoice </ReportBtn>
+ </ReportGroup>
+ </div>
+ </Panel>
+
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+ <Panel title={` Deals ${dateRangeLabel(rangeStart, rangeEnd)}`} sub={` ${dealsThisMonth.length} case By first payment date`}>
+ <TypeBars data={byType(dealsThisMonth)} />
+ <CaseMiniList list={dealsThisMonth} emptyText="case No new deposits in this period" />
+ </Panel>
+ <Panel title={` Installed ${dateRangeLabel(rangeStart, rangeEnd)}`} sub={` ${installedThisMonth.length} case`}>
+ <TypeBars data={byType(installedThisMonth)} />
+ <CaseMiniList list={installedThisMonth} emptyText="case No installs completed in this period" />
+ </Panel>
+ </div>
+
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+ <Panel title="Stage Distribution" sub="case All Cases">
+ <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+ {Object.entries(stageCounts).map(([label, count]) => (
+ <div key={label} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+ <span style={{ fontSize: 12.5, width: 220, color: "#1B2430" }}>{label}</span>
+ <div style={{ flex: 1, height: 8, background: "#F0ECE1", borderRadius: 6, overflow: "hidden" }}>
+ <div style={{ width: `${(count / Math.max(1,cases.length)) * 100}%`, height: "100%", background: "#0B2A4A" }} />
+ </div>
+ <span style={{ fontSize: 12.5, fontFamily: "'IBM Plex Mono', monospace", width: 24, textAlign: "right" }}>{count}</span>
+ </div>
+ ))}
+ </div>
+ </Panel>
+ <Panel title="Payment Progress Distribution" sub="case All Cases">
+ <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+ {buckets.map(b => (
+ <div key={b.label} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+ <span style={{ fontSize: 12.5, width: 160, color: "#1B2430" }}>{b.label}</span>
+ <div style={{ flex: 1, height: 8, background: "#F0ECE1", borderRadius: 6, overflow: "hidden" }}>
+ <div style={{ width: `${(b.count / Math.max(1,cases.length)) * 100}%`, height: "100%", background: b.color }} />
+ </div>
+ <span style={{ fontSize: 12.5, fontFamily: "'IBM Plex Mono', monospace", width: 24, textAlign: "right" }}>{b.count}</span>
+ </div>
+ ))}
+ </div>
+ </Panel>
+ </div>
+ </div>
+ );
+}
+
+function StatCard({ label, value, sub, color }) {
+ return (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: "14px 16px" }}>
+ <div style={{ fontSize: 11.5, color: "#9AA2AD", fontWeight: 600, marginBottom: 6 }}>{label}</div>
+ <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 22, fontWeight: 700, color: color || "#1B2430" }}>{value}</div>
+ <div style={{ fontSize: 11, color: "#B5AE9E", marginTop: 2 }}>{sub}</div>
+ </div>
+ );
+}
+function Panel({ title, sub, children }) {
+ return (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 16 }}>
+ <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 14.5, color: "#1B2430" }}>{title}</div>
+ <div style={{ fontSize: 11.5, color: "#9AA2AD", marginBottom: 12 }}>{sub}</div>
+ {children}
+ </div>
+ );
+}
+function ReportGroup({ label, color, children }) {
+ return (
+ <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", paddingBottom: 10, borderBottom: "1px solid #F0ECE1" }}>
+ <span style={{
+ fontSize: 11.5, fontWeight: 700, color: "#fff", width: 130, flexShrink: 0,
+ background: color || "#8A93A0", borderRadius: 7, padding: "5px 9px", lineHeight: 1.25,
+ }}>{label}</span>
+ <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>{children}</div>
+ </div>
+ );
+}
+function ReportBtn({ onClick, children }) {
+ return (
+ <button onClick={onClick} style={{ ...btnGhost, padding: "6px 12px", fontSize: 12.5 }}>
+ <Printer size={12} /> {children}
+ </button>
+ );
+}
+function TypeBars({ data }) {
+ const max = Math.max(1, ...data.map(d => d.count));
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+ {data.map(d => (
+ <div key={d.type} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+ <d.icon size={14} color="#8A93A0" />
+ <span style={{ fontSize: 12.5, width: 96, color: "#1B2430" }}>{d.label || d.type}</span>
+ <div style={{ flex: 1, height: 8, background: "#F0ECE1", borderRadius: 6, overflow: "hidden" }}>
+ <div style={{ width: `${(d.count / max) * 100}%`, height: "100%", background: "linear-gradient(90deg,#0B2A4A,#C89B3C)" }} />
+ </div>
+ <span style={{ fontSize: 12.5, fontFamily: "'IBM Plex Mono', monospace", width: 18, textAlign: "right" }}>{d.count}</span>
+ </div>
+ ))}
+ </div>
+ );
+}
+
+function CaseMiniList({ list, emptyText }) {
+ if (!list.length) return <div style={{ marginTop: 10 }}><Empty text={emptyText} /></div>;
+ return null; // the TypeBars chart above already covers this — no need to also list names here
+}
+
+/* ---------- App shell ---------- */
+
+function ReferralSubmitView({ presetCaseId, cases, onSubmit }) {
+ const presetCase = presetCaseId ? cases.find(x => x.id === presetCaseId && x.referral && x.referral.hasReferral) : null;
+ const [foundCase, setFoundCase] = useState(presetCase || null);
+ const [manualCode, setManualCode] = useState("");
+ const [notFound, setNotFound] = useState(false);
+ const [name, setName] = useState((presetCase && presetCase.referral.name) || "");
+ const [ic, setIc] = useState((presetCase && presetCase.referral.ic) || "");
+ const [tin, setTin] = useState((presetCase && presetCase.referral.tin) || "");
+ const [email, setEmail] = useState((presetCase && presetCase.referral.email) || "");
+ const [regDate, setRegDate] = useState((presetCase && presetCase.referral.date) || todayISO());
+ const [bankName, setBankName] = useState((presetCase && presetCase.referral.bankName) || "");
+ const [bankAccountNo, setBankAccountNo] = useState((presetCase && presetCase.referral.bankAccountNo) || "");
+ const [bankAccountHolder, setBankAccountHolder] = useState((presetCase && presetCase.referral.bankAccountHolder) || "");
+ const [submitted, setSubmitted] = useState(false);
+ const [editingAgain, setEditingAgain] = useState(false);
+
+ const shell = (children) => (
+ <div style={{ minHeight: "100vh", background: "#F7F5F0", fontFamily: "'Inter', sans-serif", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+ <style>{`@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=Inter:wght@400;500;600;700&display=swap');`}</style>
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 16, padding: 28, maxWidth: 440, width: "100%" }}>
+ <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 18 }}>
+ <div style={{ width: 34, height: 34, borderRadius: 9, background: "linear-gradient(135deg,#C89B3C,#0B2A4A)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+ <Sun size={18} color="#fff" />
+ </div>
+ <div>
+ <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 15 }}>Eternalgy Sdn. Bhd.</div>
+ <div style={{ fontSize: 11, color: "#9AA2AD" }}> Referral Bank Details</div>
+ </div>
+ </div>
+ {children}
+ </div>
+ </div>
+ );
+
+ if (!foundCase) {
+ const lookup = () => {
+ const code = manualCode.trim().toUpperCase();
+ const match = cases.find(x => ((x.caseNumber || x.id.slice(0, 6).toUpperCase()) === code) && x.referral && x.referral.hasReferral);
+ if (match) {
+ setFoundCase(match);
+ setName(match.referral.name || "");
+ setIc(match.referral.ic || "");
+ setTin(match.referral.tin || "");
+ setEmail(match.referral.email || "");
+ setRegDate(match.referral.date || todayISO());
+ setBankName(match.referral.bankName || "");
+ setBankAccountNo(match.referral.bankAccountNo || "");
+ setBankAccountHolder(match.referral.bankAccountHolder || "");
+ setNotFound(false);
+ } else {
+ setNotFound(true);
+ }
+ };
+ return shell(
+ <>
+ <div style={{ fontSize: 13.5, color: "#1B2430", marginBottom: 4, fontWeight: 600 }}>
+ {presetCaseId ? "Link expired" : "Referral Portal"}
+ </div>
+ <div style={{ fontSize: 12.5, color: "#6B7686", marginBottom: 14, lineHeight: 1.6 }}>
+ Enter the Case Code given to you by Eternalgy Admin to continue. It looks like <b>3YFZ4V</b>.
+ </div>
+ <Field label="Case Code">
+ <TextInput value={manualCode} onChange={e => setManualCode(e.target.value)} placeholder="e.g. 3YFZ4V" />
+ </Field>
+ {notFound && <div style={{ fontSize: 12, color: "#C24141", marginTop: 6 }}>Case not found. Please check the code with Admin.</div>}
+ <button onClick={lookup} disabled={!manualCode.trim()}
+ style={{ ...btnPrimary, width: "100%", justifyContent: "center", marginTop: 14, opacity: manualCode.trim() ? 1 : 0.45, cursor: manualCode.trim() ? "pointer" : "not-allowed" }}>
+ <Search size={14} /> Find
+ </button>
+ </>
+ );
+ }
+
+ const missingFields = [
+ !name.trim() && "Full Name",
+ !ic.trim() && "IC Number",
+ !email.trim() && "Email Address",
+ !regDate && "Registration Date",
+ !bankName.trim() && "Bank Name",
+ !bankAccountNo.trim() && "Bank Account No.",
+ !bankAccountHolder.trim() && "Account Holder Name",
+ ].filter(Boolean);
+ const canSubmit = missingFields.length === 0;
+
+ const MAX_SUBMITS = 5;
+ const usedSubmits = Number(foundCase.referral.submitCount) || 0;
+ const attemptsLeft = MAX_SUBMITS - usedSubmits;
+ // Admin can lock a referral once the details are confirmed correct — this blocks further
+ // submissions outright, independent of how many attempts were left.
+ const isLocked = !!foundCase.referral.locked;
+
+ const handleSubmit = () => {
+ if (!canSubmit || attemptsLeft <= 0 || isLocked) return;
+ // Each submission replaces the previous one outright, so the case only ever holds the
+ // details the referrer last confirmed.
+ const updated = { ...foundCase, referral: {
+ ...foundCase.referral, name, ic, tin, email, date: regDate,
+ bankName, bankAccountNo, bankAccountHolder,
+ bankSubmittedAt: todayISO(),
+ submitCount: usedSubmits + 1,
+ } };
+ onSubmit(updated);
+ setFoundCase(updated);
+ setSubmitted(true);
+ };
+
+ // Show the confirmation after submitting, but let the referrer correct a mistake while they
+ // still have attempts left — a wrong account number is far more costly to fix afterwards.
+ if (submitted || isLocked || (foundCase.referral.bankSubmittedAt && !editingAgain)) {
+ const noneLeft = attemptsLeft <= 0 || isLocked;
+ return shell(
+ <div style={{ textAlign: "center", padding: "16px 0" }}>
+ <CheckCircle2 size={32} color="#3C8C63" style={{ marginBottom: 10 }} />
+ <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 6 }}>
+ {submitted ? "Submitted" : isLocked ? "Confirmed" : "Already Submitted"}
+ </div>
+ <div style={{ fontSize: 13, color: "#6B7686", marginBottom: 10 }}>
+ {submitted
+ ? "Thank you — your details have been sent to Eternalgy."
+ : foundCase.referral.bankSubmittedAt
+ ? `Submitted on ${fmtDate(foundCase.referral.bankSubmittedAt)}.`
+ : "These details have been confirmed by Eternalgy Admin."}
+ </div>
+ <div style={{ background: "#FBFAF6", border: "1px solid #F0ECE1", borderRadius: 8,
+ padding: "10px 12px", fontSize: 12, color: "#6B7686", textAlign: "left", marginBottom: 12 }}>
+ <div><b>Bank:</b> {foundCase.referral.bankName || "-"}</div>
+ <div><b>Account No:</b> {foundCase.referral.bankAccountNo || "-"}</div>
+ <div><b>Account Holder:</b> {foundCase.referral.bankAccountHolder || "-"}</div>
+ </div>
+ {isLocked ? (
+ <div style={{ fontSize: 12, color: "#C24141" }}>
+ These details have been confirmed and locked by Eternalgy. Please contact Admin if anything needs to change.
+ </div>
+ ) : noneLeft ? (
+ <div style={{ fontSize: 12, color: "#C24141" }}>
+ You have used all {MAX_SUBMITS} submissions. Please contact Eternalgy Admin if anything needs correcting.
+ </div>
+ ) : (
+ <>
+ <div style={{ fontSize: 12, color: "#9AA2AD", marginBottom: 10 }}>
+ Please check the details above. You can still correct them {attemptsLeft} more {attemptsLeft === 1 ? "time" : "times"}.
+ </div>
+ <button onClick={() => { setSubmitted(false); setEditingAgain(true); }} style={btnGhost}>
+ Correct my details
+ </button>
+ </>
+ )}
+ </div>
+ );
+ }
+
+ return shell(
+ <>
+ <div style={{ fontSize: 14, color: "#1B2430", marginBottom: 6, fontWeight: 600 }}>
+ Referral Bank Details
+ </div>
+ <div style={{ fontSize: 12.5, color: "#6B7686", marginBottom: 16, lineHeight: 1.6 }}>
+ Please complete all required fields so Eternalgy can process your referral commission.<br/>
+ <span style={{ color: "#C24141" }}>⚠️ Payment is only made to the referrer's own account — the account holder name must match your own name. Third-party accounts are not accepted.</span>
+ </div>
+ {(Number(foundCase.referral.submitCount) || 0) > 0 && (
+ <div style={{ background: "#FFF6E8", border: "1px solid #E8C87A", borderRadius: 8,
+ padding: "8px 12px", fontSize: 12, color: "#8A6416", marginBottom: 14 }}>
+ You are updating your details. This will replace what you submitted before.
+ You have {attemptsLeft} {attemptsLeft === 1 ? "submission" : "submissions"} left.
+ </div>
+ )}
+ <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+ <Field label="Full Name">
+ <TextInput value={name} onChange={e => setName(e.target.value)} placeholder="IC Same as IC name" />
+ </Field>
+ <Field label="IC Number">
+ <TextInput value={ic} onChange={e => setIc(e.target.value)} placeholder="IC Number" />
+ </Field>
+ <Field label="TIN Number">
+ <TextInput value={tin} onChange={e => setTin(e.target.value)} placeholder="TIN Number" />
+ </Field>
+ <Field label="Email Address">
+ <TextInput value={email} onChange={e => setEmail(e.target.value)} placeholder="email@example.com" />
+ </Field>
+ <Field label="Date">
+ <DateInputDMY value={regDate} onChange={e => setRegDate(e.target.value)} />
+ </Field>
+ <div style={{ borderTop: "1px solid #F0ECE1", paddingTop: 12, marginTop: 4, fontSize: 11.5, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5 }}>
+ Bank Details
+ </div>
+ <Field label="Bank Name">
+ <TextInput value={bankName} onChange={e => setBankName(e.target.value)} placeholder="Maybank / CIMB..." />
+ </Field>
+ <Field label="Account No.">
+ <TextInput value={bankAccountNo} onChange={e => setBankAccountNo(e.target.value)} placeholder="Account No." />
+ </Field>
+ <Field label="Account Holder">
+ <TextInput value={bankAccountHolder} onChange={e => setBankAccountHolder(e.target.value)} placeholder="IC Same as IC name" />
+ </Field>
+ </div>
+ {!canSubmit && (
+ <div style={{ background: "#FBEAEA", border: "1px solid #E3A9A9", borderRadius: 8,
+ padding: "9px 12px", fontSize: 12, color: "#8B3A3A", marginTop: 14 }}>
+ Please fill in: {missingFields.join(", ")}
+ </div>
+ )}
+ <button onClick={handleSubmit} disabled={!canSubmit}
+ style={{ ...btnPrimary, width: "100%", justifyContent: "center", marginTop: 12, opacity: canSubmit ? 1 : 0.45, cursor: canSubmit ? "pointer" : "not-allowed" }}>
+ <Save size={14} /> Submit
+ </button>
+ </>
+ );
+}
+
+export default function CRMApp() {
+ const [role, setRole] = useState("admin"); // admin | agent
+ const [cases, setCases] = useState(null);
+ const [agentDirectory, setAgentDirectory] = useState(null);
+ const [itemDirectory, setItemDirectory] = useState(null);
+ const [adminDirectory, setAdminDirectory] = useState(null);
+ const [shipmentBatches, setShipmentBatches] = useState(null);
+ const [deliveryOrders, setDeliveryOrders] = useState(null);
+ const [docLogs, setDocLogs] = useState(null);
+ // Kept in sessionStorage so a page refresh doesn't force Admin to log in again. It's cleared
+ // automatically when the browser tab closes, so the session still ends when they leave.
+ const [currentOperator, setCurrentOperatorState] = useState(() => {
+ try {
+ const saved = sessionStorage.getItem("currentOperator");
+ return saved ? JSON.parse(saved) : null;
+ } catch { return null; }
+ });
+ const setCurrentOperator = useCallback((account) => {
+ setCurrentOperatorState(account);
+ try {
+ if (account) sessionStorage.setItem("currentOperator", JSON.stringify(account));
+ else sessionStorage.removeItem("currentOperator");
+ } catch { /* private mode — fall back to in-memory only */ }
+ }, []);
+ const [pendingLoginAction, setPendingLoginAction] = useState(null); // fn to run after successful login
+ const [view, setView] = useState({ screen: "dashboard" }); // dashboard | list | form | detail
+ const [search, setSearch] = useState("");
+ const [agentFilter, setAgentFilter] = useState("All");
+ const [listRangeStart, setListRangeStart] = useState("");
+ const [listRangeEnd, setListRangeEnd] = useState("");
+ const [simAgent, setSimAgent] = useState("");
+ const [printDoc, setPrintDoc] = useState(null);
+
+ useEffect(() => { loadAgentDirectory().then(setAgentDirectory); }, []);
+ useEffect(() => { loadItemDirectory().then(setItemDirectory); }, []);
+ useEffect(() => { loadAdminDirectory().then(setAdminDirectory); }, []);
+ useEffect(() => { loadShipmentBatches().then(setShipmentBatches); }, []);
+ useEffect(() => { loadDeliveryOrders().then(setDeliveryOrders); }, []);
+ useEffect(() => { loadDocLogs().then(setDocLogs); }, []);
+
+ // Cases load differently depending on which storage mode is currently active (checked once,
+ // from the database, so every open tab picks up the same answer without a redeploy). See the
+ // CASES_COLLECTION comment above for what each mode means.
+ const [casesStorageMode, setCasesStorageMode] = useState(null); // null = still checking
+ useEffect(() => { loadCasesStorageMode().then(setCasesStorageMode); }, []);
+ useEffect(() => {
+ if (casesStorageMode === null) return;
+ (casesStorageMode === "percase" ? loadCasesPerDoc() : loadCasesLegacy()).then(setCases);
+ }, [casesStorageMode]);
+
+ // Writes exactly one case. In "percase" mode this only ever touches that case's own Firestore
+ // document — that's the whole point of the migration: two people saving two different cases
+ // at the same moment can never step on each other. In "legacy" mode it still has to rewrite
+ // the entire blob (the bug this migration exists to fix), kept only so the app keeps working
+ // normally right up until the admin runs the migration.
+ const persistOne = useCallback((updatedCase, nextArray) => {
+ setCases(nextArray);
+ if (casesStorageMode === "percase") saveCasePerDoc(updatedCase);
+ else saveCasesLegacy(nextArray);
+ }, [casesStorageMode]);
+
+ const saveAdminAccount = useCallback((account) => {
+ setAdminDirectory(prev => {
+ const list = prev || [];
+ const exists = list.some(a => a.id === account.id);
+ const next = exists ? list.map(a => a.id === account.id ? account : a) : [...list, account];
+ saveAdminDirectory(next);
+ return next;
+ });
+ }, []);
+ const deleteAdminAccount = useCallback((id) => {
+ setAdminDirectory(prev => {
+ const next = (prev || []).filter(a => a.id !== id);
+ saveAdminDirectory(next);
+ return next;
+ });
+ }, []);
+
+ // Any action that edits a case (add / edit) requires being "logged in" as a staff member for this
+ // session first. If already logged in, run immediately; otherwise show the login gate and queue
+ // the action to run right after a successful login.
+ const requireLogin = useCallback((action) => {
+ if (currentOperator) { action(); return; }
+ setPendingLoginAction(() => action);
+ }, [currentOperator]);
+
+ const saveAgent = useCallback((agent) => {
+ setAgentDirectory(prev => {
+ const list = prev || [];
+ const exists = list.some(a => a.id === agent.id);
+ const next = exists ? list.map(a => a.id === agent.id ? agent : a) : [...list, agent];
+ saveAgentDirectory(next);
+ return next;
+ });
+ }, []);
+ const deleteAgent = useCallback((id) => {
+ setAgentDirectory(prev => {
+ const next = (prev || []).filter(a => a.id !== id);
+ saveAgentDirectory(next);
+ return next;
+ });
+ }, []);
+
+ const saveItem = useCallback((item) => {
+ setItemDirectory(prev => {
+ const list = prev || [];
+ const exists = list.some(i => i.id === item.id);
+ const next = exists ? list.map(i => i.id === item.id ? item : i) : [...list, item];
+ saveItemDirectory(next);
+ return next;
+ });
+ }, []);
+ const deleteItem = useCallback((id) => {
+ setItemDirectory(prev => {
+ const next = (prev || []).filter(i => i.id !== id);
+ saveItemDirectory(next);
+ return next;
+ });
+ }, []);
+
+ const saveBatch = useCallback((batch) => {
+ setShipmentBatches(prev => {
+ const list = prev || [];
+ const exists = list.some(b => b.id === batch.id);
+ const next = exists ? list.map(b => b.id === batch.id ? batch : b) : [...list, batch];
+ saveShipmentBatches(next);
+ return next;
+ });
+ }, []);
+ const deleteBatch = useCallback((id) => {
+ setShipmentBatches(prev => {
+ const next = (prev || []).filter(b => b.id !== id);
+ saveShipmentBatches(next);
+ return next;
+ });
+ }, []);
+ const saveDO = useCallback((d) => {
+ setDeliveryOrders(prev => {
+ const list = prev || [];
+ const exists = list.some(x => x.id === d.id);
+ const next = exists ? list.map(x => x.id === d.id ? d : x) : [...list, d];
+ saveDeliveryOrdersList(next);
+ return next;
+ });
+ }, []);
+ const deleteDO = useCallback((id) => {
+ setDeliveryOrders(prev => {
+ const next = (prev || []).filter(x => x.id !== id);
+ saveDeliveryOrdersList(next);
+ return next;
+ });
+ }, []);
+
+ // Records a Quotation/Proforma Invoice generation event and returns the sequence number to
+ // print on the document, so every printed doc number traces back to exactly one log entry.
+ const logDoc = useCallback((entry) => {
+ let seqOut = 1;
+ const newId = uid();
+ setDocLogs(prev => {
+ const list = prev || [];
+ const sameType = list.filter(l => l.docType === entry.docType);
+ seqOut = sameType.length + 1;
+ const next = [...list, { id: newId, timestamp: new Date().toISOString(), seq: seqOut, ...entry }];
+ saveDocLogs(next);
+ return next;
+ });
+ return { seq: seqOut, logId: newId };
+ }, []);
+
+ const agents = useMemo(() => {
+ if (!cases) return [];
+ const fromDirectory = (agentDirectory || []).map(a => a.name);
+ const fromCases = cases.filter(c => !c.deletedAt).map(c => c.agentName);
+ return Array.from(new Set([...fromDirectory, ...fromCases].filter(Boolean)));
+ }, [cases, agentDirectory]);
+
+ useEffect(() => { if (!simAgent && agents.length) setSimAgent(agents[0]); }, [agents, simAgent]);
+
+ // Cases sitting in the Recycle Bin longer than 100 days are purged for good. Checked once
+ // per load (not on every cases update) so this can't loop against its own writes.
+ const purgedOnce = useRef(false);
+ useEffect(() => {
+ if (cases === null || purgedOnce.current || casesStorageMode === null) return;
+ purgedOnce.current = true;
+ const cutoff = isoAddDays(todayISO(), -100);
+ const toPurge = cases.filter(c => c.deletedAt && c.deletedAt.slice(0, 10) < cutoff);
+ if (toPurge.length === 0) return;
+ const kept = cases.filter(c => !toPurge.some(p => p.id === c.id));
+ setCases(kept);
+ if (casesStorageMode === "percase") toPurge.forEach(c => deleteCasePerDoc(c.id));
+ else saveCasesLegacy(kept);
+ }, [cases, casesStorageMode]);
+
+ if (cases === null || agentDirectory === null || itemDirectory === null || shipmentBatches === null || deliveryOrders === null || docLogs === null) {
+ return <div style={{ padding: 40, fontFamily: "'Inter', sans-serif", color: "#6B7686" }}></div>;
+ }
+
+ // Deleted cases stay in the same array (marked with deletedAt) rather than a separate store,
+ // so a case can move between "live" and "Recycle Bin" without touching how loading/saving
+ // works. Every normal screen only ever sees liveCases; the Recycle Bin screen sees the rest.
+ const liveCases = cases.filter(c => !c.deletedAt);
+ const deletedCases = cases.filter(c => c.deletedAt).sort((a, b) => (b.deletedAt || "").localeCompare(a.deletedAt || ""));
+
+ const hash = typeof window !== "undefined" ? window.location.hash : "";
+ const refMatch = hash.match(/^#ref=(.+)$/);
+ const isReferralPortal = hash === "#referral" || !!refMatch;
+ if (isReferralPortal) {
+ return (
+ <ReferralSubmitView
+ presetCaseId={refMatch ? decodeURIComponent(refMatch[1]) : null}
+ cases={liveCases}
+ onSubmit={(updated) => persistOne(updated, cases.map(c => c.id === updated.id ? updated : c))}
+ />
+ );
+ }
+
+ const filteredAdminList = liveCases.filter(c => {
+ const q = search.trim().toLowerCase();
+ // Search also matches the Case ID — both the Admin-typed number and the auto-generated
+ // fallback — with or without the "CASE-" prefix, so either way of remembering it works.
+ const caseId = (c.caseNumber || c.id.slice(0, 6)).toLowerCase();
+ const qNoPrefix = q.replace(/^case-?/, "");
+ const matchSearch = !q
+ || (c.customerName || "").toLowerCase().includes(q)
+ || (c.agentName || "").toLowerCase().includes(q)
+ || (c.customerPhone || "").toLowerCase().includes(q)
+ || (c.customerEmail || "").toLowerCase().includes(q)
+ || caseId.includes(qNoPrefix)
+ || (c.tin || "").toLowerCase().includes(q)
+ || (c.ic || "").toLowerCase().includes(q);
+ const matchAgent = agentFilter === "All" || c.agentName === agentFilter;
+ const matchRange = (!listRangeStart && !listRangeEnd) || inRange(c.createdAt, listRangeStart || null, listRangeEnd || null);
+ return matchSearch && matchAgent && matchRange;
+ }).sort((a, b) => {
+ // Sort strictly by deposit date, newest first — a case keyed in late still sorts by when the
+ // deposit actually came in, not when Admin got around to entering it. Cases with no deposit
+ // yet have no place on that timeline, so they sit at the bottom (newest-created first).
+ const da = firstPaymentDate(a);
+ const db = firstPaymentDate(b);
+ if (da && db) return db.localeCompare(da);
+ if (da) return -1;
+ if (db) return 1;
+ return (b.createdAt || "").localeCompare(a.createdAt || "");
+ });
+
+ const agentCases = liveCases.filter(c => c.agentName === simAgent);
+
+ const openNew = () => requireLogin(() => setView({ screen: "form", editing: emptyCase(), isNew: true }));
+ const openEdit = (c) => requireLogin(() => setView({ screen: "form", editing: structuredClone(c), isNew: false }));
+ const saveCase = (c) => {
+ const exists = cases.some(x => x.id === c.id);
+ const prevCase = exists ? cases.find(x => x.id === c.id) : null;
+ const { departments, details } = changedDepartments(prevCase, c);
+ let withHistory = c;
+ if (departments.length > 0) {
+ const historyEntry = { id: uid(), editor: currentOperator ? currentOperator.name : "Unknown", timestamp: new Date().toISOString(), departments, details };
+ withHistory = { ...c, editHistory: [...(c.editHistory || []), historyEntry] };
+ }
+ const next = exists ? cases.map(x => x.id === c.id ? withHistory : x) : [...cases, withHistory];
+ persistOne(withHistory, next);
+ setView({ screen: "form", editing: withHistory, isNew: false }); // stay on the form after saving
+ };
+ // Soft delete — the case is marked with a timestamp and stops showing anywhere live, but stays
+ // in storage so it can be restored from the Recycle Bin within 100 days.
+ const deleteCase = (id) => requireLogin(() => {
+ const updated = { ...cases.find(c => c.id === id), deletedAt: new Date().toISOString() };
+ persistOne(updated, cases.map(c => c.id === id ? updated : c));
+ setView({ screen: "list" });
+ });
+ const restoreCase = (id) => requireLogin(() => {
+ const updated = { ...cases.find(c => c.id === id), deletedAt: "" };
+ persistOne(updated, cases.map(c => c.id === id ? updated : c));
+ });
+
+ return (
+ <div style={{
+ minHeight: "100vh", background: "#F7F5F0", fontFamily: "'Inter', sans-serif",
+ display: "flex", flexDirection: "column",
+ }}>
+ <style>{`
+ @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+ * { box-sizing: border-box; }
+ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid #C89B3C; outline-offset: 1px; }
+ @media print {
+ body * { visibility: hidden !important; }
+ .eternalgy-print-area, .eternalgy-print-area * { visibility: visible !important; }
+ .eternalgy-print-area { position: fixed !important; left: 0; top: 0; width: 100%; margin: 0; }
+ .no-print { display: none !important; }
+ }
+ `}</style>
+
+ {/* top bar */}
+ <div style={{ background: "#0B2A4A", padding: "14px 24px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+ <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+ <div style={{ width: 34, height: 34, borderRadius: 9, background: "linear-gradient(135deg,#C89B3C,#0B2A4A)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+ <Sun size={18} color="#fff" />
+ </div>
+ <div>
+ <div style={{ fontFamily: "'Space Grotesk', sans-serif", color: "#fff", fontWeight: 700, fontSize: 15.5, lineHeight: 1.1 }}>Eternalgy Case Hub</div>
+ <div style={{ color: "#B9C4D6", fontSize: 11 }}> </div>
+ </div>
+ </div>
+ <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+ {role === "admin" && currentOperator && (
+ <div style={{ display: "flex", alignItems: "center", gap: 6, background: "rgba(255,255,255,0.1)", borderRadius: 9, padding: "6px 10px" }}>
+ <span style={{ color: "#fff", fontSize: 12 }}>👤 {currentOperator.name}</span>
+ <button onClick={() => setCurrentOperator(null)} style={{ background: "none", border: "none", color: "#C89B3C", fontSize: 11.5, cursor: "pointer", fontWeight: 600 }}>Sign Out</button>
+ </div>
+ )}
+ <RoleTab active={role === "admin" && view.screen === "dashboard"} onClick={() => { setRole("admin"); setView({ screen: "dashboard" }); }} icon={LayoutDashboard} label="Dashboard" />
+ <RoleTab active={role === "admin"} onClick={() => { setRole("admin"); setView({ screen: "list" }); }} icon={FolderKanban} label="Admin" />
+ <RoleTab active={role === "agent"} onClick={() => { setRole("agent"); setView({ screen: "agentList" }); }} icon={Link2} label="Agent" />
+ </div>
+ </div>
+
+ <div style={{ flex: 1, padding: "24px", maxWidth: 1100, margin: "0 auto", width: "100%" }}>
+ <PrintContext.Provider value={setPrintDoc}>
+ {role === "admin" ? (
+ <AdminArea
+ cases={liveCases} deletedCases={deletedCases} restoreCase={restoreCase} view={view} setView={setView}
+ search={search} setSearch={setSearch}
+ agentFilter={agentFilter} setAgentFilter={setAgentFilter} agents={agents}
+ listRangeStart={listRangeStart} setListRangeStart={setListRangeStart}
+ listRangeEnd={listRangeEnd} setListRangeEnd={setListRangeEnd}
+ filteredAdminList={filteredAdminList}
+ openNew={openNew} openEdit={openEdit} saveCase={saveCase} deleteCase={deleteCase}
+ agentDirectory={agentDirectory} saveAgent={saveAgent} deleteAgent={deleteAgent}
+ itemDirectory={itemDirectory} saveItem={saveItem} deleteItem={deleteItem}
+ shipmentBatches={shipmentBatches} saveBatch={saveBatch} deleteBatch={deleteBatch}
+ deliveryOrders={deliveryOrders} saveDO={saveDO} deleteDO={deleteDO}
+ docLogs={docLogs} logDoc={logDoc}
+ adminDirectory={adminDirectory} saveAdminAccount={saveAdminAccount} deleteAdminAccount={deleteAdminAccount}
+ currentOperator={currentOperator} setCurrentOperator={setCurrentOperator}
+ casesStorageMode={casesStorageMode}
+ />
+ ) : (
+ <AgentArea
+ agents={agents} simAgent={simAgent} setSimAgent={setSimAgent}
+ agentCases={agentCases} view={view} setView={setView}
+ logDoc={logDoc}
+ />
+ )}
+ <PrintOverlay doc={printDoc} onClose={() => setPrintDoc(null)} />
+ {pendingLoginAction && (
+ <LoginGate
+ adminDirectory={adminDirectory || []}
+ onSuccess={(account) => {
+ setCurrentOperator(account);
+ const action = pendingLoginAction;
+ setPendingLoginAction(null);
+ action();
+ }}
+ onCancel={() => setPendingLoginAction(null)}
+ />
+ )}
+ </PrintContext.Provider>
+ </div>
+ </div>
+ );
+}
+
+function RoleTab({ active, onClick, icon: Icon, label }) {
+ return (
+ <button onClick={onClick} style={{
+ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 9,
+ border: "1px solid " + (active ? "#C89B3C" : "rgba(255,255,255,0.2)"),
+ background: active ? "#C89B3C" : "transparent", color: active ? "#0B2A4A" : "#fff",
+ fontSize: 12.5, fontWeight: 600, cursor: "pointer", fontFamily: "'Inter', sans-serif",
+ }}>
+ <Icon size={14} /> {label}
+ </button>
+ );
+}
+
+function AgentForm({ initial, onSave, onCancel, onDelete }) {
+ const [a, setA] = useState(initial);
+ const set = (field, value) => setA(prev => ({ ...prev, [field]: value }));
+ return (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 18, display: "flex", flexDirection: "column", gap: 12, maxWidth: 560 }}>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+ <Field label="Agent Name">
+ <TextInput value={a.name} onChange={e => set("name", e.target.value)} placeholder="Agent" />
+ </Field>
+ <Field label="Agent Code">
+ <TextInput value={a.code} onChange={e => set("code", e.target.value)} placeholder="e.g. AG001" />
+ </Field>
+ <Field label="Phone">
+ <TextInput value={a.phone} onChange={e => set("phone", e.target.value)} placeholder="012-3456789" />
+ </Field>
+ <Field label="Email Address">
+ <TextInput value={a.email} onChange={e => set("email", e.target.value)} placeholder="email@example.com" />
+ </Field>
+ <Field label="Referrer">
+ <TextInput value={a.referrer} onChange={e => set("referrer", e.target.value)} placeholder="Agent /PDF" />
+ </Field>
+ </div>
+ <Field label="Note">
+ <TextArea value={a.note} onChange={e => set("note", e.target.value)} placeholder="Internal notes" />
+ </Field>
+ <div style={{ fontSize: 11, color: "#B5AE9E" }}>PDF Agent + Agent Code</div>
+ <div style={{ display: "flex", justifyContent: "space-between" }}>
+ <div>{onDelete && <button onClick={onDelete} style={{ ...btnGhost, color: "#C24141", borderColor: "#F0C9C9" }}><Trash2 size={13}/> </button>}</div>
+ <div style={{ display: "flex", gap: 10 }}>
+ <button onClick={onCancel} style={btnGhost}></button>
+ <button onClick={() => onSave(a)} disabled={!a.name.trim()} style={{ ...btnPrimary, opacity: a.name.trim() ? 1 : 0.45 }}><Save size={14}/> </button>
+ </div>
+ </div>
+ </div>
+ );
+}
+
+function AdminAccountForm({ initial, onSave, onCancel, onDelete }) {
+ const [a, setA] = useState(initial);
+ const set = (field, value) => setA(prev => ({ ...prev, [field]: value }));
+ return (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 18, display: "flex", flexDirection: "column", gap: 12, maxWidth: 480 }}>
+ <div style={{ background: "#FBF8F0", border: "1px dashed #E3D8B8", borderRadius: 10, padding: 10, fontSize: 11.5, color: "#8A6414" }}>
+ ⚠️ /——
+ </div>
+ <Field label="Name Edit History">
+ <TextInput value={a.name} onChange={e => set("name", e.target.value)} placeholder="Login name" />
+ </Field>
+ <Field label="Email Address Firebase">
+ <TextInput value={a.email} onChange={e => set("email", e.target.value.toLowerCase())} placeholder="name@eternalgy.com" />
+ </Field>
+ <Field label="Password">
+ <input type="text" value={a.password} onChange={e => set("password", e.target.value.toUpperCase())}
+ placeholder="Password" style={{ ...inputStyle, textTransform: "uppercase" }} />
+ </Field>
+ <Field label="Phone">
+ <TextInput value={a.phone} onChange={e => set("phone", e.target.value)} placeholder="012-3456789" />
+ </Field>
+ <Field label="Note">
+ <TextArea value={a.note} onChange={e => set("note", e.target.value)} placeholder="Internal notes" />
+ </Field>
+ <div style={{ display: "flex", justifyContent: "space-between" }}>
+ <div>{onDelete && <button onClick={onDelete} style={{ ...btnGhost, color: "#C24141", borderColor: "#F0C9C9" }}><Trash2 size={13}/> </button>}</div>
+ <div style={{ display: "flex", gap: 10 }}>
+ <button onClick={onCancel} style={btnGhost}></button>
+ <button onClick={() => onSave(a)} disabled={!a.name.trim() || !a.password.trim()} style={{ ...btnPrimary, opacity: (a.name.trim() && a.password.trim()) ? 1 : 0.45 }}><Save size={14}/> </button>
+ </div>
+ </div>
+ </div>
+ );
+}
+
+// One-time, admin-triggered migration from the old "whole list as one blob" storage to
+// per-case Firestore documents. Copying is non-destructive — the legacy blob is left untouched,
+// so if anything looks wrong the mode can be flipped back to "legacy" immediately and nothing
+// is lost. The switch (which storage mode the app actually reads/writes from) only happens
+// after every case has been copied and the counts have been checked to match.
+function CaseStorageMigrationTool({ casesStorageMode, caseCount }) {
+ const [status, setStatus] = useState("idle"); // idle | running | done | mismatch | error
+ const [progress, setProgress] = useState(0);
+ const [legacyCount, setLegacyCount] = useState(null);
+
+ const runMigration = async () => {
+ setStatus("running");
+ setProgress(0);
+ try {
+ const legacy = await loadCasesLegacy();
+ setLegacyCount(legacy.length);
+ for (let i = 0; i < legacy.length; i++) {
+ const ok = await saveCasePerDoc(legacy[i]);
+ if (!ok) throw new Error(`Failed writing case ${i + 1} of ${legacy.length}`);
+ setProgress(i + 1);
+ }
+ const check = await storage.listCollection(CASES_COLLECTION);
+ if (check.length !== legacy.length) {
+ setStatus("mismatch");
+ return;
+ }
+ await storage.set("casesStorageMode", "percase", true);
+ setStatus("done");
+ } catch (e) {
+ console.error("Migration failed:", e);
+ setStatus("error");
+ }
+ };
+
+ const rollback = async () => {
+ if (!window.confirm("Switch back to the old storage mode? The new per-case copies stay in the database untouched — this only changes which one the app reads/writes.")) return;
+ await storage.set("casesStorageMode", "legacy", true);
+ window.location.reload();
+ };
+
+ return (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 20, marginTop: 20 }}>
+ <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Case Storage Migration</div>
+ <div style={{ fontSize: 12, color: "#6B7686", marginBottom: 14 }}>
+ Moves cases from one shared file to individual records, so two people saving different cases at the same
+ time can never overwrite each other. Currently loaded: {caseCount} cases.
+ </div>
+
+ <div style={{ fontSize: 12.5, marginBottom: 14 }}>
+ Current mode: <b style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
+ {casesStorageMode === "percase" ? "percase (new — fixed)" : "legacy (old — has the overwrite bug)"}
+ </b>
+ </div>
+
+ {casesStorageMode === "percase" ? (
+ <>
+ <div style={{ background: "#EAF5EE", border: "1px solid #B7DEC5", borderRadius: 10, padding: 12, fontSize: 12.5, color: "#2E7D6B", marginBottom: 12 }}>
+ Already migrated — the app is reading and writing per-case records. No action needed.
+ </div>
+ <button onClick={rollback} style={{ ...btnGhost, color: "#C24141", borderColor: "#F0C9C9" }}>Roll back to legacy (emergency only)</button>
+ </>
+ ) : (
+ <>
+ {status === "idle" && (
+ <button onClick={runMigration} style={btnPrimary}>Run Migration Now</button>
+ )}
+ {status === "running" && (
+ <div style={{ fontSize: 13 }}>Copying case {progress}{legacyCount ? ` of ${legacyCount}` : ""}… please don't close this tab.</div>
+ )}
+ {status === "done" && (
+ <>
+ <div style={{ background: "#EAF5EE", border: "1px solid #B7DEC5", borderRadius: 10, padding: 12, fontSize: 12.5, color: "#2E7D6B", marginBottom: 10 }}>
+ Migration complete — {legacyCount} cases copied and verified. The app is now using the new storage.
+ </div>
+ <button onClick={() => window.location.reload()} style={btnPrimary}>Reload Page</button>
+ </>
+ )}
+ {status === "mismatch" && (
+ <div style={{ background: "#FBEAEA", border: "1px solid #E3A9A9", borderRadius: 10, padding: 12, fontSize: 12.5, color: "#8B3A3A" }}>
+ Copied, but the count didn't match — the app has NOT been switched over, nothing is at risk. Please contact support before retrying.
+ </div>
+ )}
+ {status === "error" && (
+ <div style={{ background: "#FBEAEA", border: "1px solid #E3A9A9", borderRadius: 10, padding: 12, fontSize: 12.5, color: "#8B3A3A" }}>
+ Something went wrong partway through — the app has NOT been switched over, nothing is at risk. Please contact support before retrying.
+ </div>
+ )}
+ </>
+ )}
+ </div>
+ );
+}
+function AdminAccountDirectoryArea({ adminDirectory, saveAdminAccount, deleteAdminAccount }) {
+ const [editing, setEditing] = useState(null);
+ if (editing) {
+ return (
+ <div>
+ <button onClick={() => setEditing(null)} style={{ ...btnGhost, marginBottom: 16 }}><ArrowLeft size={14}/> </button>
+ <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 19, margin: "0 0 16px", color: "#1B2430" }}>
+ {editing.isNew ? "Add Staff Account" : "Edit Staff Account"}
+ </h2>
+ <AdminAccountForm
+ initial={editing.account}
+ onSave={(a) => { saveAdminAccount(a); setEditing(null); }}
+ onCancel={() => setEditing(null)}
+ onDelete={editing.isNew ? null : () => { deleteAdminAccount(editing.account.id); setEditing(null); }}
+ />
+ </div>
+ );
+ }
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+ <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+ <div style={{ fontSize: 12, color: "#9AA2AD" }}> {adminDirectory.length} — Case</div>
+ <button onClick={() => setEditing({ isNew: true, account: emptyAdminAccount() })} style={btnPrimary}><Plus size={14}/> </button>
+ </div>
+ {adminDirectory.length === 0 ? (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 24 }}>
+ <Empty text="No staff accounts yet." />
+ </div>
+ ) : (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, overflow: "hidden", overflowX: "auto" }}>
+ <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 480 }}>
+ <thead>
+ <tr style={{ background: "#FBFAF6", textAlign: "left" }}>
+ <th style={thStyle}> Name</th>
+ <th style={thStyle}>Email</th>
+ <th style={thStyle}> Phone</th>
+ <th style={thStyle}></th>
+ </tr>
+ </thead>
+ <tbody>
+ {adminDirectory.map(a => (
+ <tr key={a.id} onClick={() => setEditing({ isNew: false, account: a })} style={{ borderTop: "1px solid #F0ECE1", cursor: "pointer" }}
+ onMouseEnter={e => e.currentTarget.style.background = "#FBFAF6"}
+ onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+ <td style={{ ...tdStyle, fontWeight: 600 }}>{a.name}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace", fontSize: 12 }}>{a.email || "-"}</td>
+ <td style={tdStyle}>{a.phone || "-"}</td>
+ <td style={tdStyle}>{a.note || "-"}</td>
+ </tr>
+ ))}
+ </tbody>
+ </table>
+ </div>
+ )}
+ </div>
+ );
+}
+
+function LoginGate({ adminDirectory, onSuccess, onCancel }) {
+ const [name, setName] = useState("");
+ const [password, setPassword] = useState("");
+ const [error, setError] = useState("");
+ const submit = () => {
+ const match = adminDirectory.find(a => a.name === name && a.password === password);
+ if (match) { onSuccess(match); }
+ else { setError("Name or password incorrect."); }
+ };
+ return (
+ <div style={{ position: "fixed", inset: 0, background: "rgba(11,42,74,0.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200 }}>
+ <div style={{ background: "#fff", borderRadius: 16, padding: 28, maxWidth: 380, width: "90%" }}>
+ <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 17, marginBottom: 4 }}> Staff Login</div>
+ <div style={{ fontSize: 12.5, color: "#6B7686", marginBottom: 16 }}>Case — </div>
+ {adminDirectory.length === 0 ? (
+ <div style={{ fontSize: 13, color: "#C24141" }}></div>
+ ) : (
+ <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+ <Field label="Name">
+ <select value={name} onChange={e => { setName(e.target.value); setError(""); }} style={inputStyle}>
+ <option value=""></option>
+ {adminDirectory.map(a => <option key={a.id} value={a.name}>{a.name}</option>)}
+ </select>
+ </Field>
+ <Field label="Password">
+ <input type="password" value={password} onChange={e => { setPassword(e.target.value); setError(""); }}
+ onKeyDown={e => e.key === "Enter" && submit()} style={inputStyle} placeholder="Password" />
+ </Field>
+ {error && <div style={{ fontSize: 12, color: "#C24141" }}>{error}</div>}
+ <button onClick={submit} disabled={!name || !password} style={{ ...btnPrimary, justifyContent: "center", opacity: (name && password) ? 1 : 0.45 }}> Login</button>
+ </div>
+ )}
+ <button onClick={onCancel} style={{ ...btnGhost, width: "100%", justifyContent: "center", marginTop: 10 }}></button>
+ </div>
+ </div>
+ );
+}
+
+function AgentDirectoryArea({ agentDirectory, saveAgent, deleteAgent }) {
+ const [editing, setEditing] = useState(null);
+ if (editing) {
+ return (
+ <div>
+ <button onClick={() => setEditing(null)} style={{ ...btnGhost, marginBottom: 16 }}><ArrowLeft size={14}/> </button>
+ <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 19, margin: "0 0 16px", color: "#1B2430" }}>
+ {editing.isNew ? "Agent" : "Agent"}
+ </h2>
+ <AgentForm
+ initial={editing.agent}
+ onSave={(a) => { saveAgent(a); setEditing(null); }}
+ onCancel={() => setEditing(null)}
+ onDelete={editing.isNew ? null : () => { deleteAgent(editing.agent.id); setEditing(null); }}
+ />
+ </div>
+ );
+ }
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+ <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+ <div style={{ fontSize: 12, color: "#9AA2AD" }}> {agentDirectory.length} Agent — Case </div>
+ <button onClick={() => setEditing({ isNew: true, agent: emptyAgent() })} style={btnPrimary}><Plus size={14}/> Agent</button>
+ </div>
+ {agentDirectory.length === 0 ? (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 24 }}>
+ <Empty text="Agent Agent" />
+ </div>
+ ) : (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, overflow: "hidden", overflowX: "auto" }}>
+ <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 640 }}>
+ <thead>
+ <tr style={{ background: "#FBFAF6", textAlign: "left" }}>
+ <th style={thStyle}> Name</th>
+ <th style={thStyle}>Code</th>
+ <th style={thStyle}> Phone</th>
+ <th style={thStyle}>Email</th>
+ <th style={thStyle}> Referrer</th>
+ </tr>
+ </thead>
+ <tbody>
+ {agentDirectory.map(a => (
+ <tr key={a.id} onClick={() => setEditing({ isNew: false, agent: a })} style={{ borderTop: "1px solid #F0ECE1", cursor: "pointer" }}
+ onMouseEnter={e => e.currentTarget.style.background = "#FBFAF6"}
+ onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+ <td style={{ ...tdStyle, fontWeight: 600 }}>{a.name}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace" }}>{a.code || "-"}</td>
+ <td style={tdStyle}>{a.phone || "-"}</td>
+ <td style={tdStyle}>{a.email || "-"}</td>
+ <td style={tdStyle}>{a.referrer || "-"}</td>
+ </tr>
+ ))}
+ </tbody>
+ </table>
+ </div>
+ )}
+ </div>
+ );
+}
+
+function ItemForm({ initial, onSave, onCancel, onDelete, shippedMap }) {
+ const [it, setIt] = useState(initial);
+ const set = (field, value) => setIt(prev => ({ ...prev, [field]: value }));
+ const addStockIn = () => setIt(prev => ({ ...prev, stockIns: [...(prev.stockIns || []), { id: uid(), date: todayISO(), qty: "", note: "" }] }));
+ const updateStockIn = (id, field, value) => setIt(prev => ({ ...prev, stockIns: prev.stockIns.map(r => r.id === id ? { ...r, [field]: value } : r) }));
+ const removeStockIn = (id) => setIt(prev => ({ ...prev, stockIns: prev.stockIns.filter(r => r.id !== id) }));
+ const stock = shippedMap ? computeItemStock(it, shippedMap) : null;
+ return (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 18, display: "flex", flexDirection: "column", gap: 12, maxWidth: 560 }}>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+ <Field label="Category">
+ <Select value={it.category} onChange={e => set("category", e.target.value)} options={ITEM_CATEGORIES} />
+ </Field>
+ <Field label="Item Name">
+ <TextInput value={it.name} onChange={e => set("name", e.target.value)} placeholder="650W JinkoSolar Tiger Neo 3.0" />
+ </Field>
+ </div>
+ {it.category === "Panel" && (
+ <Field label="Watt (W) kWp">
+ <NumberInput value={it.watt} onChange={e => set("watt", e.target.value)} placeholder="e.g. 650" style={{ maxWidth: 200 }} />
+ </Field>
+ )}
+ <Field label="Description">
+ <TextArea value={it.description} onChange={e => set("description", e.target.value)} placeholder="650W JinkoSolar Tiger Neo 3.0 Panel N-Type TOPCon" style={{ minHeight: 70 }} />
+ </Field>
+ <Field label="Note /PDF">
+ <TextArea value={it.note} onChange={e => set("note", e.target.value)} placeholder="Internal notes" />
+ </Field>
+
+ <div style={{ borderTop: "1px solid #F0ECE1", paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+ <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5 }}> Stock In Records</div>
+ {stock && (
+ <div style={{ display: "flex", gap: 10, fontSize: 12, fontFamily: "'IBM Plex Mono', monospace" }}>
+ <span> In: <b>{stock.stockIn}</b></span>
+ <span> Shipped: <b>{stock.shipped}</b></span>
+ <span style={{ color: stock.remaining < 0 ? "#C24141" : "#3C8C63" }}> Stock: <b>{stock.remaining}</b></span>
+ </div>
+ )}
+ </div>
+ {(it.stockIns || []).map(r => (
+ <div key={r.id} style={{ display: "grid", gridTemplateColumns: "155px 100px 1fr auto", gap: 8, alignItems: "center" }}>
+ <DateInputDMY value={r.date} onChange={e => updateStockIn(r.id, "date", e.target.value)} />
+ <NumberInput value={r.qty} onChange={e => updateStockIn(r.id, "qty", e.target.value)} placeholder="Qty" />
+ <TextInput value={r.note} onChange={e => updateStockIn(r.id, "note", e.target.value)} placeholder="Note / PO" />
+ <button onClick={() => removeStockIn(r.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "#C24141" }}>
+ <Trash2 size={14} />
+ </button>
+ </div>
+ ))}
+ <button onClick={addStockIn} style={{ ...btnGhost, alignSelf: "flex-start" }}><Plus size={13}/> Add Stock In</button>
+ </div>
+
+ <div style={{ display: "flex", justifyContent: "space-between" }}>
+ <div>{onDelete && <button onClick={onDelete} style={{ ...btnGhost, color: "#C24141", borderColor: "#F0C9C9" }}><Trash2 size={13}/> </button>}</div>
+ <div style={{ display: "flex", gap: 10 }}>
+ <button onClick={onCancel} style={btnGhost}></button>
+ <button onClick={() => onSave(it)} disabled={!it.name.trim()} style={{ ...btnPrimary, opacity: it.name.trim() ? 1 : 0.45 }}><Save size={14}/> </button>
+ </div>
+ </div>
+ </div>
+ );
+}
+
+function ItemDirectoryArea({ itemDirectory, saveItem, deleteItem, cases }) {
+ const [editing, setEditing] = useState(null);
+ const [catFilter, setCatFilter] = useState("All");
+ const shippedMap = useMemo(() => computeShippedByModel(cases || []), [cases]);
+ if (editing) {
+ return (
+ <div>
+ <button onClick={() => setEditing(null)} style={{ ...btnGhost, marginBottom: 16 }}><ArrowLeft size={14}/> </button>
+ <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 19, margin: "0 0 16px", color: "#1B2430" }}>
+ {editing.isNew ? "Add Item" : "Edit Item"}
+ </h2>
+ <ItemForm
+ initial={editing.item}
+ onSave={(it) => { saveItem(it); setEditing(null); }}
+ onCancel={() => setEditing(null)}
+ onDelete={editing.isNew ? null : () => { deleteItem(editing.item.id); setEditing(null); }}
+ shippedMap={shippedMap}
+ />
+ </div>
+ );
+ }
+ const list = sortItemsByCapacity(itemDirectory.filter(it => catFilter === "All" || it.category === catFilter));
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+ <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+ <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+ <select value={catFilter} onChange={e => setCatFilter(e.target.value)} style={{ ...inputStyle, width: 140 }}>
+ <option value="All"> All</option>
+ {ITEM_CATEGORIES.map(cat => <option key={cat} value={cat}>{cat}</option>)}
+ </select>
+ <div style={{ fontSize: 12, color: "#9AA2AD", alignSelf: "center" }}> {list.length} </div>
+ </div>
+ <button onClick={() => setEditing({ isNew: true, item: emptyItem() })} style={btnPrimary}><Plus size={14}/> </button>
+ </div>
+ {list.length === 0 ? (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 24 }}>
+ <Empty text="No items yet." />
+ </div>
+ ) : (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, overflow: "hidden", overflowX: "auto" }}>
+ <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 640 }}>
+ <thead>
+ <tr style={{ background: "#FBFAF6", textAlign: "left" }}>
+ <th style={thStyle}> Category</th>
+ <th style={thStyle}> / </th>
+ <th style={{ ...thStyle, width: "35%" }}>Description</th>
+ <th style={thStyle}> Stock</th>
+ </tr>
+ </thead>
+ <tbody>
+ {list.map(it => {
+ const stock = computeItemStock(it, shippedMap);
+ return (
+ <tr key={it.id} onClick={() => setEditing({ isNew: false, item: it })}
+ style={{ borderTop: "1px solid #F0ECE1", borderLeft: `4px solid ${ITEM_CATEGORY_COLORS[it.category] || "#9AA2AD"}`, cursor: "pointer" }}
+ onMouseEnter={e => e.currentTarget.style.background = "#FBFAF6"}
+ onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+ <td style={tdStyle}><Badge color={ITEM_CATEGORY_COLORS[it.category] || "#9AA2AD"}>{it.category}</Badge></td>
+ <td style={{ ...tdStyle, fontWeight: 600 }}>{it.name}{it.watt ? ` (${it.watt}W)` : ""}</td>
+ <td style={{ ...tdStyle, fontSize: 12, color: "#6B7686" }}>{it.description || "-"}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 700, color: stock.remaining < 0 ? "#C24141" : "#1B2430" }}>
+ {stock.stockIn > 0 || stock.shipped > 0 ? stock.remaining : "-"}
+ </td>
+ </tr>
+ );})}
+ </tbody>
+ </table>
+ </div>
+ )}
+ </div>
+ );
+}
+
+function ShipmentBatchArea({ batches, saveBatch, deleteBatch, cases }) {
+ const [openId, setOpenId] = useState(null);
+ const [customerQuery, setCustomerQuery] = useState("");
+
+ const openBatch = openId ? batches.find(b => b.id === openId) : null;
+
+ if (openBatch) {
+ const batchCases = openBatch.caseIds.map(id => cases.find(c => c.id === id)).filter(Boolean);
+ const candidates = customerQuery.trim()
+ ? cases.filter(c =>
+ !openBatch.caseIds.includes(c.id) &&
+ !(c.cancellation && c.cancellation.isCancelled) &&
+ (c.customerName || "").toLowerCase().includes(customerQuery.trim().toLowerCase())
+ ).slice(0, 8)
+ : [];
+
+ const addCustomer = (caseId) => {
+ const next = { ...openBatch, caseIds: [...openBatch.caseIds, caseId] };
+ saveBatch(next);
+ setCustomerQuery("");
+ };
+ const removeCustomer = (caseId) => {
+ saveBatch({ ...openBatch, caseIds: openBatch.caseIds.filter(id => id !== caseId) });
+ };
+ const setLabel = (label) => saveBatch({ ...openBatch, label });
+ const setShipDate = (key, value) => saveBatch({ ...openBatch, shipDates: { ...openBatch.shipDates, [key]: value } });
+ const setNote = (note) => saveBatch({ ...openBatch, note });
+
+ // Sum every case's items together by (key + model), so the same model across different
+ // customers becomes one line with a combined quantity — exactly the "same product, added
+ // together" behaviour from the Excel sheet.
+ const { totals, order } = batchItemTotals(openBatch, cases);
+
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+ <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+ <button onClick={() => setOpenId(null)} style={btnGhost}><ArrowLeft size={14}/> </button>
+ <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11.5, color: "#3C8C63", fontWeight: 600 }}>
+ <CheckCircle2 size={13} /> Auto-saved — /
+ </div>
+ </div>
+
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 18, display: "flex", flexDirection: "column", gap: 12 }}>
+ <Field label="Batch Label 01/06 - 07/06">
+ <TextInput value={openBatch.label} onChange={e => setLabel(e.target.value)} placeholder="Batch 1 / 01/06-07/06" />
+ </Field>
+
+ <div style={{ borderTop: "1px solid #F0ECE1", paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5 }}> Add Customer</div>
+ <div style={{ position: "relative" }}>
+ <TextInput value={customerQuery} onChange={e => setCustomerQuery(e.target.value)} placeholder="Search customer name" />
+ {candidates.length > 0 && (
+ <div style={{ position: "absolute", top: "100%", left: 0, right: 0, background: "#fff", border: "1px solid #E2DDD0", borderRadius: 8, marginTop: 4, zIndex: 10, boxShadow: "0 4px 12px rgba(0,0,0,0.08)" }}>
+ {candidates.map(c => (
+ <div key={c.id} onClick={() => addCustomer(c.id)}
+ style={{ padding: "8px 12px", cursor: "pointer", fontSize: 13, borderBottom: "1px solid #F0ECE1" }}
+ onMouseEnter={e => e.currentTarget.style.background = "#FBFAF6"}
+ onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
+ <b>{c.customerName}</b> <span style={{ color: "#9AA2AD", fontSize: 11.5 }}> - {agentDisplay(c)}</span>
+ </div>
+ ))}
+ </div>
+ )}
+ </div>
+ </div>
+
+ {batchCases.length > 0 && (
+ <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+ {batchCases.map(c => {
+ const items = caseShipItems(c);
+ return (
+ <div key={c.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 10px", background: "#FBFAF6", borderRadius: 8, fontSize: 12.5 }}>
+ <div>
+ <b>{c.customerName || "-"}</b>
+ <span style={{ color: "#9AA2AD", marginLeft: 8 }}>
+ {items.length ? items.map(it => `${it.label} ${it.model} x${it.qty}`).join("　") : "No Shippable Items"}
+ </span>
+ </div>
+ <button onClick={() => removeCustomer(c.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "#C24141" }}>
+ <Trash2 size={14} />
+ </button>
+ </div>
+ );
+ })}
+ </div>
+ )}
+
+ <div style={{ borderTop: "1px solid #F0ECE1", paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5 }}> + Batch Totals + Ship Date</div>
+ {order.length === 0 ? (
+ <Empty text="No customers added yet." />
+ ) : (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 10, overflow: "hidden" }}>
+ <table style={{ width: "100%", borderCollapse: "collapse" }}>
+ <thead>
+ <tr style={{ background: "#FBFAF6", textAlign: "left" }}>
+ <th style={thStyle}> Item</th>
+ <th style={thStyle}> Model</th>
+ <th style={thStyle}> Total Qty</th>
+ <th style={thStyle}> Ship Date</th>
+ </tr>
+ </thead>
+ <tbody>
+ {order.map(tk => {
+ const t = totals[tk];
+ return (
+ <tr key={tk} style={{ borderTop: "1px solid #F0ECE1" }}>
+ <td style={tdStyle}>{t.label}</td>
+ <td style={{ ...tdStyle, fontWeight: 600 }}>{t.model}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace" }}>{t.qty}</td>
+ <td style={tdStyle}>
+ <DateInputDMY value={openBatch.shipDates[tk] || ""} onChange={e => setShipDate(tk, e.target.value)} />
+ </td>
+ </tr>
+ );
+ })}
+ </tbody>
+ </table>
+ </div>
+ )}
+ </div>
+
+ <AdminNote value={openBatch.note} onChange={e => setNote(e.target.value)} />
+
+ <div>
+ <button onClick={() => { deleteBatch(openBatch.id); setOpenId(null); }} style={{ ...btnGhost, color: "#C24141", borderColor: "#F0C9C9" }}>
+ <Trash2 size={13}/> 
+ </button>
+ </div>
+ </div>
+ </div>
+ );
+ }
+
+ const sorted = batches.slice().sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+ <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+ <div style={{ fontSize: 12, color: "#9AA2AD" }}> {batches.length} </div>
+ <button onClick={() => { const b = emptyShipmentBatch(); saveBatch(b); setOpenId(b.id); }} style={btnPrimary}>
+ <Plus size={14}/> New Batch
+ </button>
+ </div>
+ {sorted.length === 0 ? (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 24 }}>
+ <Empty text="No batches yet — click New Batch." />
+ </div>
+ ) : (
+ <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+ {sorted.map(b => {
+ const pending = batchPendingCount(b, cases);
+ const isPending = pending > 0;
+ return (
+ <div key={b.id} onClick={() => setOpenId(b.id)}
+ style={{
+ background: isPending ? "#FFF8E8" : "#fff",
+ border: `1px solid ${isPending ? "#E8C87A" : "#E9E4D8"}`,
+ borderLeft: `4px solid ${isPending ? "#D98C3D" : "#E9E4D8"}`,
+ borderRadius: 12, padding: "12px 16px", cursor: "pointer",
+ display: "flex", justifyContent: "space-between", alignItems: "center",
+ }}
+ onMouseEnter={e => e.currentTarget.style.background = isPending ? "#FFF3D6" : "#FBFAF6"}
+ onMouseLeave={e => e.currentTarget.style.background = isPending ? "#FFF8E8" : "#fff"}>
+ <div>
+ <div style={{ fontWeight: 600, fontSize: 13.5, display: "flex", alignItems: "center", gap: 8 }}>
+ {b.label || "Unnamed Batch"}
+ {isPending && <Badge color="#D98C3D"> {pending} </Badge>}
+ </div>
+ <div style={{ fontSize: 11.5, color: "#9AA2AD" }}>{b.caseIds.length} {fmtDate(b.createdAt)}</div>
+ </div>
+ <ChevronRight size={16} color="#C9C2AE" />
+ </div>
+ );
+ })}
+ </div>
+ )}
+ </div>
+ );
+}
+
+// One case per Delivery Order, but a case can have several DOs over time (goods often go out in
+// stages). Picking a customer pulls in everything that case is entitled to ship; the Ordered /
+// Shipped elsewhere / Remaining columns come straight from every other DO already on file for
+// that same case, so Admin always sees exactly what's still outstanding.
+function DeliveryOrderArea({ deliveryOrders, saveDO, deleteDO, cases, agentDirectory }) {
+ const [openId, setOpenId] = useState(null);
+ const [customerQuery, setCustomerQuery] = useState("");
+ const setPrintDoc = useContext(PrintContext);
+
+ const openDO = openId ? deliveryOrders.find(d => d.id === openId) : null;
+
+ if (openDO) {
+ const caseObj = cases.find(c => c.id === openDO.caseId) || null;
+ const candidates = (!openDO.caseId && customerQuery.trim())
+ ? cases.filter(c => (c.customerName || "").toLowerCase().includes(customerQuery.trim().toLowerCase())).slice(0, 8)
+ : [];
+
+ const pickCustomer = (c) => {
+ const ordered = caseOrderedItems(c);
+ const shipped = shippedQtyByItemForCase(c.id, deliveryOrders, openDO.id);
+ // Default every line to exactly what's still remaining, so the common case (send
+ // whatever's left) needs zero typing — Admin only has to adjust it down for a partial DO.
+ const items = ordered.map(it => {
+ const tk = `${it.key}::${it.model}`;
+ const remaining = Math.max(0, it.qty - (shipped[tk] || 0));
+ return { tk, key: it.key, label: it.label, model: it.model, qty: remaining };
+ }).filter(it => it.qty > 0);
+ saveDO({ ...openDO, caseId: c.id, items });
+ setCustomerQuery("");
+ };
+
+ const setField = (field, value) => saveDO({ ...openDO, [field]: value });
+ const orderedItems = caseObj ? caseOrderedItems(caseObj) : [];
+ const shippedElsewhere = caseObj ? shippedQtyByItemForCase(caseObj.id, deliveryOrders, openDO.id) : {};
+ const addChecklistRow = () => saveDO({ ...openDO, checklist: [...openDO.checklist, { id: uid(), name: "", model: "", qty: "" }] });
+ const updateChecklistRow = (id, field, value) => saveDO({ ...openDO, checklist: openDO.checklist.map(it => it.id === id ? { ...it, [field]: value } : it) });
+ const removeChecklistRow = (id) => saveDO({ ...openDO, checklist: openDO.checklist.filter(it => it.id !== id) });
+
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+ <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+ <button onClick={() => setOpenId(null)} style={btnGhost}><ArrowLeft size={14}/> Back</button>
+ <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11.5, color: "#3C8C63", fontWeight: 600 }}>
+ <CheckCircle2 size={13} /> Auto-saved
+ </div>
+ </div>
+
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 18, display: "flex", flexDirection: "column", gap: 14 }}>
+
+ {!openDO.caseId ? (
+ <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5 }}>Select Customer</div>
+ <div style={{ position: "relative" }}>
+ <TextInput value={customerQuery} onChange={e => setCustomerQuery(e.target.value)} placeholder="Search customer name" />
+ {candidates.length > 0 && (
+ <div style={{ position: "absolute", top: "100%", left: 0, right: 0, background: "#fff", border: "1px solid #E2DDD0", borderRadius: 8, marginTop: 4, zIndex: 10, boxShadow: "0 4px 12px rgba(0,0,0,0.08)" }}>
+ {candidates.map(c => (
+ <div key={c.id} onClick={() => pickCustomer(c)}
+ style={{ padding: "8px 12px", cursor: "pointer", fontSize: 13, borderBottom: "1px solid #F0ECE1" }}
+ onMouseEnter={e => e.currentTarget.style.background = "#FBFAF6"}
+ onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
+ <b>{c.customerName}</b> <span style={{ color: "#9AA2AD", fontSize: 11.5 }}> - {agentDisplay(c)}</span>
+ </div>
+ ))}
+ </div>
+ )}
+ </div>
+ </div>
+ ) : (
+ <>
+ <div style={{ background: "#F0F6FB", border: "1px solid #CFE2F0", borderRadius: 10, padding: 12, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+ <div>
+ <div style={{ fontSize: 11, color: "#2C5F8A", fontWeight: 700 }}>Customer</div>
+ <div style={{ fontSize: 14, fontWeight: 700 }}>{caseObj ? (caseObj.customerName || "Unnamed") : "Case not found"}</div>
+ </div>
+ <button onClick={() => saveDO({ ...openDO, caseId: "", items: [] })} style={{ ...btnGhost, padding: "6px 10px", fontSize: 11.5 }}>Change</button>
+ </div>
+
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5 }}>DO NUMBER</div>
+ <div style={{ display: "grid", gridTemplateColumns: "100px 90px 1fr", gap: 8, alignItems: "end" }}>
+ <Field label="Year">
+ <Select value={openDO.doYear} onChange={e => setField("doYear", e.target.value)}
+ options={Array.from({ length: 6 }, (_, i) => String(new Date().getFullYear() - 1 + i))} />
+ </Field>
+ <Field label="Month">
+ <Select value={openDO.doMonth} onChange={e => setField("doMonth", e.target.value)}
+ options={Array.from({ length: 12 }, (_, i) => String(i + 1).padStart(2, "0"))} />
+ </Field>
+ <Field label="Serial No. (type manually)">
+ <TextInput value={openDO.doSerial} onChange={e => setField("doSerial", e.target.value)} placeholder="001" />
+ </Field>
+ </div>
+ <div style={{ fontSize: 12, color: "#6B7686" }}>DO Number: <b style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{doNumberDisplay(openDO)}</b></div>
+
+ <Field label="DO Date">
+ <DateInputDMY value={openDO.date} onChange={e => setField("date", e.target.value)} style={{ maxWidth: 200 }} />
+ </Field>
+
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5, marginTop: 4 }}>DELIVERY ADDRESS</div>
+ <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+ {DO_ADDRESS_OPTIONS.map(opt => (
+ <label key={opt.key} style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12.5, cursor: "pointer" }}>
+ <input type="radio" checked={openDO.addressType === opt.key} onChange={() => setField("addressType", opt.key)} style={{ marginTop: 3 }} />
+ <div>
+ <div>{opt.label}</div>
+ {opt.key === "install" && <div style={{ fontSize: 11, color: "#9AA2AD" }}>{(caseObj && caseObj.installAddress) || "-"}</div>}
+ {(opt.key === "klang" || opt.key === "kluang") && <div style={{ fontSize: 11, color: "#9AA2AD" }}>{DO_FIXED_ADDRESSES[opt.key]}</div>}
+ </div>
+ </label>
+ ))}
+ {openDO.addressType === "custom" && (
+ <TextArea value={openDO.customAddress} onChange={e => setField("customAddress", e.target.value)} placeholder="Type delivery address" style={{ marginLeft: 24, minHeight: 50 }} />
+ )}
+ </div>
+
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5, marginTop: 4 }}>ITEMS ON THIS DO</div>
+ <div style={{ fontSize: 11, color: "#9AA2AD" }}>
+ These ship in full whenever included — tick to send the whole remaining quantity on this DO. Ordered = total bought. Shipped elsewhere = already sent on other DOs. Remaining = what's left.
+ </div>
+ {orderedItems.length === 0 ? (
+ <Empty text="This case has no shippable items." />
+ ) : (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 10, overflow: "hidden", overflowX: "auto" }}>
+ <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 560 }}>
+ <thead><tr style={{ background: "#FBFAF6" }}>
+ <th style={thStyle}>Item</th><th style={thStyle}>Model</th>
+ <th style={thStyle}>Ordered</th><th style={thStyle}>Shipped elsewhere</th>
+ <th style={thStyle}>Remaining</th><th style={thStyle}>Include on this DO</th>
+ </tr></thead>
+ <tbody>
+ {orderedItems.map(it => {
+ const tk = `${it.key}::${it.model}`;
+ const already = shippedElsewhere[tk] || 0;
+ const remaining = Math.max(0, it.qty - already);
+ const included = openDO.items.some(x => x.tk === tk);
+ return (
+ <tr key={tk} style={{ borderTop: "1px solid #F0ECE1" }}>
+ <td style={tdStyle}>{it.label}</td>
+ <td style={{ ...tdStyle, fontWeight: 600 }}>{it.model || "-"}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace" }}>{it.qty}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace" }}>{already}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace", color: remaining > 0 ? "#8A6414" : "#3C8C63", fontWeight: 700 }}>{remaining}</td>
+ <td style={tdStyle}>
+ <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: remaining > 0 ? "pointer" : "not-allowed", opacity: remaining > 0 ? 1 : 0.4 }}>
+ <input type="checkbox" checked={included} disabled={remaining <= 0} onChange={e => {
+ const checked = e.target.checked;
+ const nextItems = checked
+ ? [...openDO.items.filter(x => x.tk !== tk), { tk, key: it.key, label: it.label, model: it.model, qty: remaining }]
+ : openDO.items.filter(x => x.tk !== tk);
+ saveDO({ ...openDO, items: nextItems });
+ }} />
+ <span style={{ fontSize: 12, fontFamily: "'IBM Plex Mono', monospace" }}>{included ? `Yes (${remaining})` : "No"}</span>
+ </label>
+ </td>
+ </tr>
+ );
+ })}
+ </tbody>
+ </table>
+ </div>
+ )}
+
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5, marginTop: 8 }}>ACCESSORY CHECKLIST (rails, clamps, brackets…)</div>
+ <div style={{ fontSize: 11, color: "#9AA2AD" }}>
+ Not tracked against the case — type the real name/model/quantity being packed on this specific DO, same as before.
+ </div>
+ <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 320, overflowY: "auto", paddingRight: 4 }}>
+ {openDO.checklist.map((it, i) => (
+ <div key={it.id} style={{ display: "grid", gridTemplateColumns: "20px 1fr 130px 80px auto", gap: 8, alignItems: "center" }}>
+ <span style={{ fontSize: 10.5, color: "#B5AE9E" }}>{i + 1}</span>
+ <TextInput value={it.name} onChange={e => updateChecklistRow(it.id, "name", e.target.value)} placeholder="Item Name" />
+ <TextInput value={it.model} onChange={e => updateChecklistRow(it.id, "model", e.target.value)} placeholder="Model/Spec" />
+ <NumberInput value={it.qty} onChange={e => updateChecklistRow(it.id, "qty", e.target.value)} placeholder="Qty" />
+ <button onClick={() => removeChecklistRow(it.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "#C24141" }}>
+ <Trash2 size={14} />
+ </button>
+ </div>
+ ))}
+ <button onClick={addChecklistRow} style={{ ...btnGhost, alignSelf: "flex-start" }}><Plus size={13}/> Add Item</button>
+ </div>
+
+ <div style={{ fontSize: 11, fontWeight: 700, color: "#9AA2AD", letterSpacing: 0.5, marginTop: 8 }}>DELIVERY DETAILS</div>
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+ <Field label="Pick up ( + )">
+ <TextInput value={openDO.pickupDateTime} onChange={e => setField("pickupDateTime", e.target.value)} placeholder="30/7/2026 @ 8:30am" />
+ </Field>
+ <Field label="Delivery Date">
+ <DateInputDMY value={openDO.deliveryDate} onChange={e => setField("deliveryDate", e.target.value)} />
+ </Field>
+ <Field label="Lorry No.">
+ <TextInput value={openDO.lorryNo} onChange={e => setField("lorryNo", e.target.value)} placeholder="JMG8811" />
+ </Field>
+ <Field label="Time (start)">
+ <TextInput value={openDO.deliveryTimeStart} onChange={e => setField("deliveryTimeStart", e.target.value)} placeholder="2.00pm" />
+ </Field>
+ <Field label="Time (end)">
+ <TextInput value={openDO.deliveryTimeEnd} onChange={e => setField("deliveryTimeEnd", e.target.value)} placeholder="2.30pm" />
+ </Field>
+ <div />
+ <Field label="Driver Name">
+ <TextInput value={openDO.driverName} onChange={e => setField("driverName", e.target.value)} placeholder="KHAIRUL" />
+ </Field>
+ <Field label="Driver Phone">
+ <TextInput value={openDO.driverPhone} onChange={e => setField("driverPhone", e.target.value)} placeholder="011-56590082" />
+ </Field>
+ <div />
+ <Field label="Material Planner">
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 118px", gap: 6 }}>
+ <TextInput value={openDO.materialPlanner} onChange={e => setField("materialPlanner", e.target.value)} placeholder="Name" />
+ <DateInputDMY value={openDO.materialPlannerDate} onChange={e => setField("materialPlannerDate", e.target.value)} />
+ </div>
+ </Field>
+ <Field label="Warehouse Manager">
+ <div style={{ display: "grid", gridTemplateColumns: "1fr 118px", gap: 6 }}>
+ <div style={{ padding: "5px 7px", fontSize: 12, border: "1px solid #F0ECE1", borderRadius: 8, background: "#FBFAF6", color: "#1B2430", fontWeight: 600 }}>
+ {WAREHOUSE_MANAGER_NAME}
+ </div>
+ <DateInputDMY value={openDO.warehouseManagerDate} onChange={e => setField("warehouseManagerDate", e.target.value)} />
+ </div>
+ </Field>
+ <div />
+ </div>
+ <Field label="Remarks"><TextInput value={openDO.remarks} onChange={e => setField("remarks", e.target.value)} /></Field>
+
+ <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+ <button onClick={() => { if (caseObj) setPrintDoc(buildDOPrintDoc(openDO, caseObj)); }}
+ disabled={!caseObj || !openDO.doSerial}
+ style={{ ...btnPrimary, opacity: (!caseObj || !openDO.doSerial) ? 0.45 : 1 }}>
+ <FileDown size={14} /> Generate / Print DO
+ </button>
+ {caseObj && (
+ <button onClick={() => openWhatsApp(agentPhoneFor(caseObj, agentDirectory), buildDOWhatsAppText(caseObj, openDO))}
+ disabled={!agentPhoneFor(caseObj, agentDirectory)}
+ style={{ ...btnGhost, opacity: agentPhoneFor(caseObj, agentDirectory) ? 1 : 0.45 }}>
+ 💬 WhatsApp Agent to Confirm Goods
+ </button>
+ )}
+ </div>
+ {!openDO.doSerial && <div style={{ fontSize: 11, color: "#C24141" }}>Fill in the Serial No. before generating.</div>}
+ {caseObj && !agentPhoneFor(caseObj, agentDirectory) && <div style={{ fontSize: 11, color: "#B5AE9E" }}>This case's Agent has no phone number on file.</div>}
+
+ <AdminNote value={openDO.note} onChange={e => setField("note", e.target.value)} />
+
+ <div>
+ <button onClick={() => { deleteDO(openDO.id); setOpenId(null); }} style={{ ...btnGhost, color: "#C24141", borderColor: "#F0C9C9" }}>
+ <Trash2 size={13}/> Delete DO
+ </button>
+ </div>
+ </>
+ )}
+ </div>
+ </div>
+ );
+ }
+
+ const sorted = deliveryOrders.slice().sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+ <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+ <div style={{ fontSize: 12, color: "#9AA2AD" }}>{deliveryOrders.length} Delivery Orders</div>
+ <button onClick={() => { const d = emptyDeliveryOrder(); saveDO(d); setOpenId(d.id); }} style={btnPrimary}>
+ <Plus size={14}/> New DO
+ </button>
+ </div>
+ {sorted.length === 0 ? (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 24 }}>
+ <Empty text="No delivery orders yet — click New DO." />
+ </div>
+ ) : (
+ <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+ {sorted.map(d => {
+ const c = cases.find(cc => cc.id === d.caseId);
+ return (
+ <div key={d.id} onClick={() => setOpenId(d.id)}
+ style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 12, padding: "12px 16px", cursor: "pointer",
+ display: "flex", justifyContent: "space-between", alignItems: "center" }}
+ onMouseEnter={e => e.currentTarget.style.background = "#FBFAF6"}
+ onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
+ <div>
+ <div style={{ fontWeight: 600, fontSize: 13.5 }}>
+ {fmtDate(d.date)} &nbsp; <span style={{ fontFamily: "'IBM Plex Mono', monospace", color: "#6B7686" }}>{doNumberDisplay(d)}</span>
+ </div>
+ <div style={{ fontSize: 11.5, color: "#9AA2AD" }}>{c ? (c.customerName || "Unnamed") : "No customer selected"}</div>
+ </div>
+ <ChevronRight size={16} color="#C9C2AE" />
+ </div>
+ );
+ })}
+ </div>
+ )}
+ </div>
+ );
+}
+
+// A plain <select> only jumps by first letter, which stops being usable once the agent list
+// grows. This is a type-to-filter combo box: type any part of a name or code to narrow the
+// list, then click to pick.
+function AgentPicker({ agentDirectory, agentName, onPick, invalid }) {
+ const [query, setQuery] = useState("");
+ const [open, setOpen] = useState(false);
+ const boxRef = useRef(null);
+
+ useEffect(() => {
+ const onDocClick = (e) => { if (boxRef.current && !boxRef.current.contains(e.target)) setOpen(false); };
+ document.addEventListener("mousedown", onDocClick);
+ return () => document.removeEventListener("mousedown", onDocClick);
+ }, []);
+
+ const q = query.trim().toLowerCase();
+ const matches = (agentDirectory || []).filter(a =>
+ !q || (a.name || "").toLowerCase().includes(q) || (a.code || "").toLowerCase().includes(q)
+ );
+
+ return (
+ <div ref={boxRef} style={{ position: "relative" }}>
+ <input
+ value={open ? query : (agentName || "")}
+ onChange={e => { setQuery(e.target.value); setOpen(true); }}
+ onFocus={() => { setQuery(""); setOpen(true); }}
+ placeholder="Type to search agent..."
+ style={{ ...inputStyle, padding: "5px 7px", fontSize: 12,
+ ...(agentName ? {} : { borderColor: "#C24141", background: "#FBEAEA" }) }} />
+ {open && (
+ <div style={{ position: "absolute", top: "100%", left: 0, right: 0, zIndex: 20, marginTop: 3,
+ background: "#fff", border: "1px solid #E2DDD0", borderRadius: 8, maxHeight: 220,
+ overflowY: "auto", boxShadow: "0 6px 18px rgba(0,0,0,0.10)" }}>
+ {agentName && (
+ <div onMouseDown={e => { e.preventDefault(); onPick(null); setQuery(""); setOpen(false); }}
+ style={{ padding: "6px 10px", fontSize: 11.5, color: "#C24141", cursor: "pointer", borderBottom: "1px solid #F0ECE1" }}>
+ Clear selection
+ </div>
+ )}
+ {matches.length === 0 ? (
+ <div style={{ padding: "8px 10px", fontSize: 12, color: "#9AA2AD" }}>No match</div>
+ ) : matches.map(a => (
+ <div key={a.id} onMouseDown={e => { e.preventDefault(); onPick(a); setQuery(""); setOpen(false); }}
+ style={{ padding: "6px 10px", fontSize: 12, cursor: "pointer",
+ background: a.name === agentName ? "#FBFAF6" : "#fff" }}
+ onMouseEnter={e => e.currentTarget.style.background = "#F0F6FB"}
+ onMouseLeave={e => e.currentTarget.style.background = a.name === agentName ? "#FBFAF6" : "#fff"}>
+ <b>{a.name}</b>{a.code ? <span style={{ color: "#9AA2AD" }}> ({a.code})</span> : ""}
+ </div>
+ ))}
+ </div>
+ )}
+ </div>
+ );
+}
+
+function ItemPicker({ category, itemDirectory, model, onModelChange, onDescriptionChange, onWattChange, placeholder }) {
+ const options = sortItemsByCapacity((itemDirectory || []).filter(it => it.category === category));
+ const matched = options.find(it => it.name === model);
+ if (options.length === 0) {
+ // Nothing registered yet for this category — fall back to manual typing so Admin isn't blocked.
+ return <TextInput value={model} onChange={e => onModelChange(e.target.value)} placeholder={placeholder || "No items yet"} />;
+ }
+ return (
+ <select
+ value={matched ? matched.id : ""}
+ onChange={e => {
+ const it = options.find(o => o.id === e.target.value);
+ if (it) { onModelChange(it.name); onDescriptionChange(it.description); if (onWattChange) onWattChange(it.watt || ""); }
+ else { onModelChange(""); onDescriptionChange(""); if (onWattChange) onWattChange(""); }
+ }}
+ style={inputStyle}
+ >
+ <option value=""> Select</option>
+ {options.map(it => <option key={it.id} value={it.id}>{it.name}{it.watt ? ` (${it.watt}W)` : ""}</option>)}
+ </select>
+ );
+}
+
+function AdminArea({ cases, deletedCases, restoreCase, view, setView, search, setSearch, agentFilter, setAgentFilter, agents, listRangeStart, setListRangeStart, listRangeEnd, setListRangeEnd, filteredAdminList, openNew, openEdit, saveCase, deleteCase, agentDirectory, saveAgent, deleteAgent, itemDirectory, saveItem, deleteItem, shipmentBatches, saveBatch, deleteBatch, deliveryOrders, saveDO, deleteDO, docLogs, logDoc, adminDirectory, saveAdminAccount, deleteAdminAccount, currentOperator, setCurrentOperator, casesStorageMode }) {
+ if (view.screen === "form") {
+ return (
+ <div>
+ <button onClick={() => setView({ screen: "list" })} style={{ ...btnGhost, marginBottom: 16 }}>
+ <ArrowLeft size={14} /> 
+ </button>
+ <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 19, margin: "0 0 16px", color: "#1B2430" }}>
+ {view.isNew ? "Case" : "Case"}
+ </h2>
+ <CaseForm
+ initial={view.editing}
+ onSave={saveCase}
+ onCancel={() => setView({ screen: "list" })}
+ onDelete={view.isNew ? null : () => {
+ // Confirm before anything happens — this used to be a single click away from wiping a
+ // case, which is exactly how it kept getting hit by mistake while clearing a typo
+ // elsewhere on the form. Deleting is still fully recoverable (Recycle Bin, 100 days),
+ // but the confirmation is what stops the accidental click in the first place.
+ const ok = window.confirm(
+ `Delete case "${view.editing.customerName || "Unnamed"}"?\n\nIt will move to the Recycle Bin and can be restored there within 100 days.`
+ );
+ if (ok) deleteCase(view.editing.id);
+ }}
+ agentDirectory={agentDirectory}
+ itemDirectory={itemDirectory}
+ logDoc={logDoc}
+ actorName={currentOperator ? currentOperator.name : "Admin"}
+ />
+ </div>
+ );
+ }
+
+ // Mirrors the Install Queue report's rule — 60% paid, or a loan with LO in hand, or a deposit
+ // on a job with no approval stage, or a management override. Keeping one rule in both places
+ // stops the tab and the report from showing different lists.
+ const awaitingInstallList = cases
+ .filter(c => {
+ if (installComplete(c) || (c.cancellation && c.cancellation.isCancelled)) return false;
+ if (!needsInstallCrew(c)) return false;
+ if (c.payment.installOverride) return true;
+ if (skipsSedaTnb(c)) return paymentTotal(c) > 0;
+ return paymentPercent(c) >= 60 || (c.payment.isLoanCase && !!c.payment.loReceivedDate);
+ })
+ .sort((a, b) => paymentPercent(b) - paymentPercent(a));
+
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+ <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+ <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+ <TabBtn active={view.screen === "list" || !view.screen} onClick={() => setView({ screen: "list" })} icon={FolderKanban} label="All Cases" color="#0B2A4A" />
+ <TabBtn active={view.screen === "awaiting"} onClick={() => setView({ screen: "awaiting"})} icon={Truck} label={`Awaiting Install (${awaitingInstallList.length})`} color="#D98C3D" />
+ <TabBtn active={view.screen === "batches"} onClick={() => setView({ screen: "batches" })} icon={Truck} label="Shipment Batches" color="#2E7D6B" />
+ <TabBtn active={view.screen === "deliveryOrders"} onClick={() => setView({ screen: "deliveryOrders" })} icon={FileDown} label="Delivery Orders" color="#0E7C7B" />
+ </div>
+ <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+ <TabBtn active={view.screen === "agents"} onClick={() => setView({ screen: "agents" })} icon={Users} label="Agent" />
+ <TabBtn active={view.screen === "items"} onClick={() => setView({ screen: "items" })} icon={FileCheck2} label="Items" />
+ <TabBtn active={view.screen === "admins"} onClick={() => setView({ screen: "admins" })} icon={ShieldCheck} label="Staff Accounts" />
+ <TabBtn active={view.screen === "recycleBin"} onClick={() => setView({ screen: "recycleBin" })} icon={Trash2} label={`Recycle Bin${deletedCases.length ? ` (${deletedCases.length})` : ""}`} color="#8B3A3A" />
+ </div>
+ </div>
+
+ {view.screen === "dashboard" ? (
+ <Dashboard cases={cases} itemDirectory={itemDirectory} docLogs={docLogs} agentDirectory={agentDirectory} deliveryOrders={deliveryOrders} />
+ ) : view.screen === "agents" ? (
+ <AgentDirectoryArea agentDirectory={agentDirectory} saveAgent={saveAgent} deleteAgent={deleteAgent} />
+ ) : view.screen === "items" ? (
+ <ItemDirectoryArea itemDirectory={itemDirectory} saveItem={saveItem} deleteItem={deleteItem} cases={cases} />
+ ) : view.screen === "recycleBin" ? (
+ <RecycleBinArea deletedCases={deletedCases} restoreCase={restoreCase} />
+ ) : view.screen === "batches" ? (
+ <ShipmentBatchArea batches={shipmentBatches} saveBatch={saveBatch} deleteBatch={deleteBatch} cases={cases} />
+ ) : view.screen === "deliveryOrders" ? (
+ <DeliveryOrderArea deliveryOrders={deliveryOrders} saveDO={saveDO} deleteDO={deleteDO} cases={cases} agentDirectory={agentDirectory} />
+ ) : view.screen === "admins" ? (
+ <>
+ <AdminAccountDirectoryArea adminDirectory={adminDirectory || []} saveAdminAccount={saveAdminAccount} deleteAdminAccount={deleteAdminAccount} />
+ <CaseStorageMigrationTool casesStorageMode={casesStorageMode} caseCount={cases.length} />
+ </>
+ ) : view.screen === "awaiting" ? (
+ <>
+ <div style={{ fontSize: 12, color: "#9AA2AD" }}>
+ 60% case — {awaitingInstallList.length} 
+ </div>
+ <AdminCaseTable cases={awaitingInstallList} onEdit={openEdit} />
+ </>
+ ) : (
+ <>
+ <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+ <div style={{ position: "relative", flex: 1, minWidth: 220 }}>
+ <Search size={14} color="#9AA2AD" style={{ position: "absolute", left: 10, top: 10 }} />
+ <TextInput value={search} onChange={e => setSearch(e.target.value)} placeholder="Search Case ID / Name / Phone / Email / Agent / IC" style={{ paddingLeft: 30, width: "100%" }} />
+ </div>
+ <Select value={agentFilter} onChange={e => setAgentFilter(e.target.value)} options={[{ value: "All", label: "All Agents" }, ...agents]} style={{ width: 160 }} />
+ <DateInputDMY value={listRangeStart} onChange={e => setListRangeStart(e.target.value)} style={{ width: 140 }} />
+ <span style={{ color: "#B5AE9E", fontSize: 12 }}></span>
+ <DateInputDMY value={listRangeEnd} onChange={e => setListRangeEnd(e.target.value)} style={{ width: 140 }} />
+ {(listRangeStart || listRangeEnd) && (
+ <button onClick={() => { setListRangeStart(""); setListRangeEnd(""); }} style={{ ...btnGhost, padding: "8px 10px", fontSize: 12 }}></button>
+ )}
+ <button onClick={openNew} style={btnPrimary}><Plus size={14} /> Case</button>
+ </div>
+ <div style={{ fontSize: 12, color: "#9AA2AD" }}> {filteredAdminList.length} case / </div>
+ <AdminCaseTable cases={filteredAdminList} onEdit={openEdit} />
+ </>
+ )}
+ </div>
+ );
+}
+
+const thStyle = { padding: "5px 9px", fontSize: 10.5, fontWeight: 700, color: "#8A93A0", letterSpacing: 0.3 };
+const tdStyle = { padding: "4px 9px", fontSize: 12, color: "#1B2430", verticalAlign: "middle" };
+
+function RecycleBinArea({ deletedCases, restoreCase }) {
+ const daysLeft = (c) => {
+ if (!c.deletedAt) return 100;
+ const deleted = c.deletedAt.slice(0, 10);
+ const elapsed = Math.floor((new Date(todayISO()) - new Date(deleted)) / 86400000);
+ return Math.max(0, 100 - elapsed);
+ };
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+ <div style={{ background: "#FBF8F0", border: "1px dashed #E3D8B8", borderRadius: 12, padding: 14, fontSize: 12.5, color: "#8A6414" }}>
+ Deleted cases stay here for 100 days and can be restored any time before then. After 100 days they're removed for good.
+ </div>
+ {deletedCases.length === 0 ? (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 24 }}>
+ <Empty text="Recycle Bin is empty." />
+ </div>
+ ) : (
+ <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+ {deletedCases.map(c => (
+ <div key={c.id} style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 12, padding: "12px 16px",
+ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+ <div>
+ <div style={{ fontWeight: 600, fontSize: 13.5 }}>{c.customerName || "Unnamed Customer"}</div>
+ <div style={{ fontSize: 11.5, color: "#9AA2AD" }}>
+ Agent: {agentDisplay(c)} &nbsp;|&nbsp; Deleted {fmtDate(c.deletedAt.slice(0, 10))} &nbsp;|&nbsp;
+ <span style={{ color: daysLeft(c) <= 14 ? "#C24141" : "#9AA2AD", fontWeight: daysLeft(c) <= 14 ? 700 : 400 }}>
+ {daysLeft(c)} days left before permanent removal
+ </span>
+ </div>
+ </div>
+ <button onClick={() => restoreCase(c.id)} style={btnPrimary}>
+ Restore
+ </button>
+ </div>
+ ))}
+ </div>
+ )}
+ </div>
+ );
+}
+
+function AdminCaseTable({ cases, onEdit }) {
+ if (!cases.length) return <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, padding: 24 }}><Empty text="case" /></div>;
+ return (
+ <div style={{ background: "#fff", border: "1px solid #E9E4D8", borderRadius: 14, overflow: "hidden", overflowX: "auto" }}>
+ <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 760 }}>
+ <thead>
+ <tr style={{ background: "#FBFAF6", textAlign: "left" }}>
+ <th style={thStyle}></th>
+ <th style={thStyle}>Agent</th>
+ <th style={thStyle}></th>
+ <th style={thStyle}></th>
+ <th style={thStyle}></th>
+ <th style={thStyle}></th>
+ <th style={thStyle}></th>
+ </tr>
+ </thead>
+ <tbody>
+ {cases.map(c => {
+ const stage = stageOf(c);
+ const dep = firstPaymentDate(c);
+ return (
+ <tr key={c.id} onClick={() => onEdit(c)}
+ style={{ borderTop: "1px solid #F0ECE1", borderLeft: `4px solid ${PACKAGE_TYPE_COLORS[c.pkg.packageType] || "#9AA2AD"}`, cursor: "pointer" }}
+ onMouseEnter={e => e.currentTarget.style.background = "#FBFAF6"}
+ onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+ <td style={tdStyle}>
+ <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 5 }}>
+ {c.customerName || "Unnamed"}
+ {c.billingName && c.billingName.trim() && c.billingName.trim() !== c.customerName.trim() && (
+ <span title={` Billing Name: ${c.billingName}`} style={{ fontSize: 9.5, color: "#2C5F8A", background: "#F0F6FB", border: "1px solid #CFE2F0", borderRadius: 5, padding: "1px 4px", fontWeight: 700 }}>Billing≠SEDA</span>
+ )}
+ </div>
+ <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 1 }}>
+ <span style={{ fontSize: 10, color: "#9AA2AD" }}>{c.customerPhone || "-"}</span>
+ <Badge color={PACKAGE_TYPE_COLORS[c.pkg.packageType] || "#9AA2AD"}>{c.pkg.packageType}</Badge>
+ {c.pkg.caseType && c.pkg.caseType !== "New Installation" && c.pkg.packageType === "Solar Package" && <Badge color={CASE_TYPE_COLORS[c.pkg.caseType] || "#9AA2AD"}>{c.pkg.caseType}</Badge>}
+ {isEV(c) && c.pkg.evJobType && <Badge color={EV_JOB_COLORS[c.pkg.evJobType] || "#9AA2AD"}>{c.pkg.evJobType}</Badge>}
+ {c.payment.isLoanCase && <Badge color="#2C5F8A">LOAN</Badge>}
+ {c.payment.installOverride && <Badge color="#C24141">⚡ SPECIAL</Badge>}
+ </div>
+ </td>
+ <td style={tdStyle}>{agentDisplay(c)}</td>
+ <td style={tdStyle}>{c.pkg.propertyType}{c.pkg.packageType === "Solar Package" ? ` - ${c.pkg.systemType}` : ` - ${c.pkg.packageType === "EV Charger Package" ? "EV" : "Other"}`}</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace", color: dep ? "#1B2430" : "#B5AE9E" }}>
+ {dep ? monthLabel(monthKey(dep)) : "No Deposit"}
+ </td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace" }}>{paymentPercent(c)}%</td>
+ <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace" }}>{fmtMoney(c.pkg.sellingPrice)}</td>
+ <td style={tdStyle}><Badge color={stage.color}>{stage.label} - {stage.en}</Badge></td>
+ </tr>
+ );
+ })}
+ </tbody>
+ </table>
+ </div>
+ );
+}
+
+function TabBtn({ active, onClick, icon: Icon, label, color }) {
+ const accent = color || "#0B2A4A";
+ return (
+ <button onClick={onClick} style={{
+ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 9,
+ border: "1px solid " + (active ? accent : (color ? color : "#E2DDD0")),
+ background: active ? accent : (color ? `${color}1A` : "#fff"), color: active ? "#fff" : (color || "#1B2430"),
+ fontSize: 12.5, fontWeight: 600, cursor: "pointer", fontFamily: "'Inter', sans-serif",
+ }}>
+ <Icon size={14} /> {label}
+ </button>
+ );
+}
+
+function AgentArea({ agents, simAgent, setSimAgent, agentCases, view, setView, logDoc }) {
+ if (view.screen === "agentDetail") {
+ const c = agentCases.find(x => x.id === view.caseId);
+ if (!c) return null;
+ return (
+ <div>
+ <button onClick={() => setView({ screen: "agentList" })} style={{ ...btnGhost, marginBottom: 16 }}>
+ <ArrowLeft size={14} /> Case
+ </button>
+ <div style={{ marginBottom: 4, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+ <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 19, margin: 0, color: "#1B2430" }}>{c.customerName || "Unnamed Customer"}</h2>
+ </div>
+ <CaseDetailReadOnly c={c} isAgentView logDoc={logDoc} actorName={simAgent} />
+ </div>
+ );
+ }
+
+ return (
+ <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+ <div style={{ background: "#FBF8F0", border: "1px dashed #E3D8B8", borderRadius: 12, padding: 14, display: "flex", alignItems: "center", gap: 10 }}>
+ <Link2 size={16} color="#B08A2E" />
+ <div style={{ fontSize: 12.5, color: "#8A6D1F" }}>
+ —— Agent <code>/agent/ABC123</code>case
+ </div>
+ </div>
+ <Field label="Agent">
+ <Select value={simAgent} onChange={e => setSimAgent(e.target.value)} options={agents.length ? agents : ["Agent"]} style={{ width: 240 }} />
+ </Field>
+ <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 19, margin: 0, color: "#1B2430" }}> Case{agentCases.length}</h2>
+ <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+ {agentCases.length ? agentCases.map(c => (
+ <CaseCard key={c.id} c={c} onClick={() => setView({ screen: "agentDetail", caseId: c.id })} />
+ )) : <Empty text="Agent case" />}
+ </div>
+ </div>
+ );
+}
