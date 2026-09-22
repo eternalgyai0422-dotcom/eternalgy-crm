@@ -7,40 +7,45 @@ import CRMApp from "./CRMApp";
 // never exposed to someone who merely has the link.
 export default function App() {
   const [user, setUser] = useState(undefined); // undefined = still checking
-  const [referralAuthReady, setReferralAuthReady] = useState(false);
+  const [noLoginAuthReady, setNoLoginAuthReady] = useState(false);
 
   useEffect(() => onAuthStateChanged(auth, setUser), []);
 
-  // The referral portal is meant to be opened by a customer/referrer who has no staff account —
-  // that's the whole point of the #ref= link. It must stay reachable even before Firebase has
-  // confirmed (or denied) a login, so it's checked first and bypasses the staff auth gate below.
+  // Two routes are meant to be opened by someone with no staff account: the referral portal
+  // (#ref=) for a customer/referrer, and the Agent Portal (#agent) for an Agent logging in with
+  // the name+password Admin set for them. Both must stay reachable even before Firebase has
+  // confirmed (or denied) a staff login, so they're checked first and bypass the staff auth
+  // gate below.
   const hash = typeof window !== "undefined" ? window.location.hash : "";
   const isReferralPortal = hash === "#referral" || /^#ref=/.test(hash);
+  const isAgentPortal = hash === "#agent";
+  const isNoLoginRoute = isReferralPortal || isAgentPortal;
 
   // Firestore's security rules require *some* signed-in user before any read/write is allowed —
-  // that's what protects the data from being fetched by a stranger with no link at all. A
-  // referrer has no staff account, so an anonymous sign-in stands in for a real login here: it
-  // satisfies that rule without granting the referrer anything beyond what the (unguessable)
-  // link itself already exposes.
+  // that's what protects the data from being fetched by a stranger with no link at all. Neither
+  // a referrer nor an Agent has a staff account, so an anonymous sign-in stands in for a real
+  // login here: it satisfies that rule without granting either of them anything beyond what
+  // their own portal already exposes (the referral link's unguessable id, or the Agent's own
+  // name+password check inside the Agent Portal itself).
   useEffect(() => {
-    if (!isReferralPortal) return;
+    if (!isNoLoginRoute) return;
     let cancelled = false;
     const unsub = onAuthStateChanged(auth, (u) => {
       if (cancelled) return;
       if (u) {
-        setReferralAuthReady(true);
+        setNoLoginAuthReady(true);
       } else {
         signInAnonymously(auth).catch((err) => {
           console.error("Anonymous sign-in failed:", err);
-          setReferralAuthReady(true); // let the page render; the read/write itself will surface the error
+          setNoLoginAuthReady(true); // let the page render; the read/write itself will surface the error
         });
       }
     });
     return () => { cancelled = true; unsub(); };
-  }, [isReferralPortal]);
+  }, [isNoLoginRoute]);
 
-  if (isReferralPortal) {
-    if (!referralAuthReady) {
+  if (isNoLoginRoute) {
+    if (!noLoginAuthReady) {
       return (
         <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
           background: "#F7F5F0", color: "#6B7686", fontFamily: "'Inter', sans-serif", fontSize: 14 }}>
